@@ -1,0 +1,42 @@
+# 配置模板 —— 请复制为 config.yaml 后按需修改。
+# 密钥请通过环境变量或 .env 注入（见 .env.example），不要写在本文件里。
+# config.yaml 默认会被 .gitignore 排除，本文件（config.example.yaml）才是可提交的模板。
+
+database:
+  path: data/stock.db
+
+llm:
+  provider: openai  # claude or openai
+  claude_api_key: ""    # 建议用环境变量 CLAUDE_API_KEY 注入
+  openai_api_key: ""    # 建议用环境变量 OPENAI_API_KEY 注入
+  openai_base_url: "https://api.siliconflow.cn"  # 可配置第三方兼容接口（或 OPENAI_BASE_URL）
+  model_claude: claude-sonnet-4-6
+  model_openai: Pro/MiniMaxAI/MiniMax-M2.5
+
+data:
+  cache_days: 1  # 行情数据缓存天数，避免重复拉取
+  history_years: 3  # 默认拉取几年历史数据
+
+data_sources:
+  tushare:
+    token: ""           # 建议用环境变量 TUSHARE_TOKEN 注入（填入 token 后 enabled 改 true）
+    enabled: false
+  tencent:
+    enabled: true       # 腾讯财经实时行情，免费无需账号
+  cninfo:
+    enabled: true       # 巨潮资讯公告，免费无需账号
+  ifind:
+    token: ""           # 预留：同花顺iFinD token
+    enabled: false
+
+strategy:
+  default_stock_pool: "沪深A股"  # 默认选股范围
+  top_n: 20  # 选股结果默认展示前N只
+
+backtest:
+  initial_cash: 1000000  # 初始资金（元）
+  commission: 0.0003  # 手续费率（买卖各0.03%）
+  stamp_duty: 0.001  # 印花税（卖出0.1%）
+
+trading:
+  initial_cash: 500000  # 模拟交易初始资金

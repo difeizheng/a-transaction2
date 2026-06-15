@@ -1,0 +1,4 @@
+# 开发/测试依赖（不进运行时 requirements.txt）
+# 运行测试：pip install -r requirements-dev.txt && pytest
+pytest>=8.0.0
+pytest-cov>=4.1.0
