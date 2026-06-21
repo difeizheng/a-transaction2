@@ -114,7 +114,7 @@ class TencentFetcher(BaseFetcher):
         v_sh600519="1~贵州茅台~600519~1800.00~1750.00~1810.00~..."
         字段为 split('~') 后的 0-based 索引：
           fields[1]=名称, fields[3]=昨收, fields[5]=现价,
-          fields[32]=涨跌幅(%), fields[36]=成交量(手), fields[37]=成交额(元)
+          fields[32]=涨跌幅(%), fields[36]=成交量(手), fields[37]=成交额(万元)
         """
         rows = []
         # 匹配每行数据
@@ -136,7 +136,10 @@ class TencentFetcher(BaseFetcher):
                     "price": price,
                     "pct_chg": float(fields[32]) if fields[32] else 0.0,
                     "volume": float(fields[36]) * 100 if fields[36] else 0.0,  # 手→股
-                    "amount": float(fields[37]) if fields[37] else 0.0,
+                    # 腾讯 amount 单位为「万元」，akshare/tushare 均为「元」——
+                    # 跨源切换（路由 realtime: tencent↔akshare）必须统一到元，否则
+                    # amount 差 10000 倍，污染市值估算与 LLM 输入。
+                    "amount": float(fields[37]) * 10000 if fields[37] else 0.0,
                 })
             except (ValueError, IndexError):
                 continue

@@ -18,6 +18,11 @@ _METHOD_MAP = {
     "news":            "get_news_em",
 }
 
+# 确定性错误：源代码 bug（字段映射错位/解析失败），切备源也会同样失败。
+# 直接抛出暴露问题——不计入 source 失败统计、不触发备源切换、不留误导性失败记录。
+# 网络类错误（超时/连接/HTTP/限流及未知异常）仍走原逻辑切备源。
+_DETERMINISTIC_ERRORS = (KeyError, ValueError, AttributeError, TypeError, IndexError)
+
 
 class SourceRouter:
     """
@@ -95,9 +100,17 @@ class SourceRouter:
             # 该源不支持此类型，静默跳过，不记录失败
             logger.debug(f"[路由] {source_name!r} 不支持 {data_type}，跳过")
             return None
+        except _DETERMINISTIC_ERRORS as e:
+            # 确定性错误（字段映射/解析 bug）：切备源也会同样失败，直接抛出暴露问题，
+            # 不记录失败、不触发备源切换，避免静默掩盖代码 bug。
+            logger.error(
+                f"[路由] {source_name!r}.{method_name} 确定性错误（不切源）: "
+                f"{type(e).__name__}: {e}"
+            )
+            raise
         except Exception as e:
             self.storage.record_source_failure(source_name, data_type, str(e))
-            logger.warning(f"[路由] {source_name!r}.{method_name} 失败: {e}")
+            logger.warning(f"[路由] {source_name!r}.{method_name} 失败（将切备源）: {e}")
             return None
 
     def get_routes(self) -> list:

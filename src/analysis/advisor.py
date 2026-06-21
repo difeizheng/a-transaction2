@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 class Advisor:
     def __init__(self, config: dict, data_manager: DataManager):
-        self.llm = LLMAnalyzer(config)
+        # 注入 storage 使 LLMAnalyzer 每次调用落 llm_call_log（审计/成本/幻觉追溯）
+        self.llm = LLMAnalyzer(config, getattr(data_manager, "storage", None))
         self.dm = data_manager
 
     def analyze_market(self) -> dict:
@@ -133,7 +134,7 @@ class Advisor:
             **record,
             "policy_read": prose.get("policy_read", ""),
             "indicators_meta": snapshot["indicators"],   # 带 latest/reference/as_of，UI 展示用
-            "indicator_names": snapshot.get("indicator_names", {}),
+            "indicator_names": macro.INDICATOR_NAMES,
             "as_of": snapshot.get("as_of"),
             "source": snapshot.get("source"),
         }
@@ -326,14 +327,12 @@ class Advisor:
   "key_factors": ["关键影响因素1", "关键影响因素2", "关键影响因素3"]
 }}"""
 
-        raw = self.llm.call(prompt)
-        try:
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            return json.loads(raw[start:end])
-        except Exception:
-            return {
-                "trend": "未知", "confidence": 0,
-                "buy_suggestion": "观望", "analysis": raw[:300],
-                "stop_loss_pct": 8, "take_profit_pct": 20,
-            }
+        raw = self.llm.call(prompt, endpoint="enhanced_stock")
+        data = self.llm._parse_json_lenient(raw, "enhanced_stock")
+        if data:
+            return data
+        return {
+            "trend": "未知", "confidence": 0,
+            "buy_suggestion": "观望", "analysis": raw[:300],
+            "stop_loss_pct": 8, "take_profit_pct": 20,
+        }

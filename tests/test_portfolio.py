@@ -3,6 +3,8 @@
 依赖 storage / portfolio fixture（每测独立临时库，见 conftest.py）。
 覆盖交易系统资金正确性的核心路径。
 """
+import json  # noqa: F401  (保留给后续断言扩展)
+import pandas as pd
 import pytest
 
 
@@ -112,3 +114,78 @@ class TestValuation:
         assert s["market_value"] == 1200.0
         # 总资产 = 现金(1,000,000-1005.1) + 市值 1200
         assert s["total_value"] == pytest.approx(1_000_000.0 - 1005.1 + 1200.0)
+
+
+def _seed_prev_close(storage, code="000001", close=10.0, trade_date="2024-01-01"):
+    """往临时库插一根日K，作为涨跌停校验的 prev_close 来源（主板 ±10%）。"""
+    storage.upsert_daily_bars(pd.DataFrame([{
+        "code": code, "trade_date": trade_date,
+        "open": close, "high": close, "low": close, "close": close,
+        "volume": 1000.0, "amount": 10000.0, "pct_chg": 0.0,
+    }]))
+
+
+# ── 加仓 T+1（回归：旧实现加仓后 buy_date 不更新，end_of_day 误解锁当日加仓部分）──
+class TestAddBuyT1:
+    @pytest.mark.integration
+    def test_same_day_add_buy_stays_locked(self, portfolio):
+        portfolio.buy("000001", "X", 10.00, 100, "2024-01-01")
+        portfolio.buy("000001", "X", 10.00, 100, "2024-01-01")  # 同日加仓
+        pos = portfolio.get_position("000001")
+        assert pos["quantity"] == 200
+        assert pos["available"] == 0  # 当天买入全部不可卖
+        portfolio.end_of_day("2024-01-01")
+        assert portfolio.get_position("000001")["available"] == 0  # 当日日终不解锁
+        portfolio.end_of_day("2024-01-02")
+        assert portfolio.get_position("000001")["available"] == 200  # 次日全解锁
+
+    @pytest.mark.integration
+    def test_cross_day_add_buy_new_portion_locked_at_eod(self, portfolio):
+        """核心回归：跨日加仓后，当日日终不得解锁新加仓部分（旧 bug 会解锁）。"""
+        portfolio.buy("000001", "X", 10.00, 100, "2024-01-01")
+        portfolio.end_of_day("2024-01-02")
+        assert portfolio.get_position("000001")["available"] == 100  # 第1批解锁
+
+        portfolio.buy("000001", "X", 10.00, 100, "2024-01-03")  # 跨日加仓
+        pos = portfolio.get_position("000001")
+        assert pos["quantity"] == 200
+        assert pos["available"] == 100  # 旧 100 可卖，新 100 锁定
+
+        portfolio.end_of_day("2024-01-03")
+        # 旧 bug：buy_date 仍为 01-01 → != 01-03 → 把全部 200 解锁（T+0 违规）
+        assert portfolio.get_position("000001")["available"] == 100
+
+        portfolio.end_of_day("2024-01-04")
+        assert portfolio.get_position("000001")["available"] == 200  # 次日才全解锁
+
+
+# ── 涨跌停校验（Portfolio 层兜底）──────────────────────────────
+class TestPriceLimit:
+    @pytest.mark.integration
+    def test_buy_at_limit_up_rejected(self, storage, portfolio):
+        _seed_prev_close(storage, close=10.00)  # 主板 ±10% → 涨停价 11.00
+        result = portfolio.buy("000001", "X", 11.00, 100, "2024-01-02")
+        assert result["success"] is False
+        assert "涨停" in result["msg"]
+        assert portfolio.get_position("000001") is None  # 未建仓
+
+    @pytest.mark.integration
+    def test_buy_below_limit_up_ok(self, storage, portfolio):
+        _seed_prev_close(storage, close=10.00)
+        result = portfolio.buy("000001", "X", 10.80, 100, "2024-01-02")  # < 11.00
+        assert result["success"] is True
+
+    @pytest.mark.integration
+    def test_sell_at_limit_down_rejected(self, storage, portfolio):
+        _seed_prev_close(storage, close=10.00)  # 跌停价 9.00
+        portfolio.buy("000001", "X", 9.50, 100, "2024-01-01")  # 9.5 未触涨跌停
+        portfolio.end_of_day("2024-01-02")
+        result = portfolio.sell("000001", 9.00, 100, "2024-01-02")
+        assert result["success"] is False
+        assert "跌停" in result["msg"]
+
+    @pytest.mark.integration
+    def test_no_prev_close_skips_check(self, portfolio):
+        # 空库（无 daily_bars）不拦截，保证新上市/无数据场景正常下单
+        result = portfolio.buy("000001", "X", 10.00, 100, "2024-01-01")
+        assert result["success"] is True

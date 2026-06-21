@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, List
 import pandas as pd
 from sqlalchemy import (
-    create_engine, text, MetaData, Table, Column,
+    create_engine, text, MetaData, Table, Column, event,
     String, Float, Date, DateTime, Integer, Text,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -52,10 +52,33 @@ def _make_upsert_method(pk_cols):
 
 def _engine(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(
+    engine = create_engine(
         f"sqlite:///{db_path}", echo=False,
         connect_args={"timeout": 30},  # 防后台写锁冲突
     )
+    # WAL 模式：读不阻塞写。后台批量更新（batch_update_bars_v2）长时间持写锁时，
+    # 前端读不再被阻塞 30s 后抛 database is locked。WAL 为数据库级持久设置；
+    # synchronous=NORMAL 为连接级，每个新连接都需设，故用 connect 事件监听器。
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, conn_record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.close()
+
+    return engine
+
+
+# 历史迁移：每条对应一次 schema 演进。新库 CREATE TABLE 已含这些列（迁移对新库
+# 是 no-op，靠 _column_exists 幂等预检跳过）；旧库靠迁移补列。追加新列只需在
+# 列表末尾加一条 (version, 描述, ALTER SQL)，_run_migrations 会自动按序应用。
+_MIGRATIONS = [
+    (1, "daily_bars 复权因子(adj_factor)",     "ALTER TABLE daily_bars ADD COLUMN adj_factor REAL"),
+    (2, "financial_data 披露日(ann_date,PIT)", "ALTER TABLE financial_data ADD COLUMN ann_date TEXT"),
+    (3, "news URL",                             "ALTER TABLE news ADD COLUMN url TEXT DEFAULT ''"),
+    (4, "positions 买入日(buy_date,T+1)",       "ALTER TABLE positions ADD COLUMN buy_date TEXT"),
+    (5, "account 峰值(peak_value,回撤)",        "ALTER TABLE account ADD COLUMN peak_value REAL"),
+]
 
 
 class Storage:
@@ -84,11 +107,7 @@ class Storage:
                     PRIMARY KEY (code, trade_date)
                 )
             """))
-            # Migration: 为旧库补 adj_factor 列（复权因子，P1 raw+factor 重构预留）
-            try:
-                conn.execute(text("ALTER TABLE daily_bars ADD COLUMN adj_factor REAL"))
-            except Exception:
-                pass  # Column already exists
+            # adj_factor 列：新库由 CREATE TABLE 定义；旧库由 _run_migrations v1 补。
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS financial_data (
                     code TEXT,
@@ -99,11 +118,7 @@ class Storage:
                     PRIMARY KEY (code, report_date)
                 )
             """))
-            # Migration: 为旧库补 ann_date 列（财务 point-in-time，堵前视偏差）
-            try:
-                conn.execute(text("ALTER TABLE financial_data ADD COLUMN ann_date TEXT"))
-            except Exception:
-                pass  # Column already exists
+            # ann_date 列：新库由 CREATE TABLE 定义；旧库由 _run_migrations v2 补。
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS news (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,11 +133,7 @@ class Storage:
                     created_at TEXT
                 )
             """))
-            # Migration: add url column if not exists (for existing DBs)
-            try:
-                conn.execute(text("ALTER TABLE news ADD COLUMN url TEXT DEFAULT ''"))
-            except Exception:
-                pass  # Column already exists
+            # url 列：新库由 CREATE TABLE 定义；旧库由 _run_migrations v3 补。
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS backtest_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,11 +181,7 @@ class Storage:
                     updated_at TEXT
                 )
             """))
-            # Migration: 为旧库补 buy_date 列（旧表无此列，导致T+1状态无法持久化）
-            try:
-                conn.execute(text("ALTER TABLE positions ADD COLUMN buy_date TEXT"))
-            except Exception:
-                pass  # Column already exists
+            # buy_date 列：新库由 CREATE TABLE 定义；旧库由 _run_migrations v4 补。
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS account (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -184,11 +191,7 @@ class Storage:
                     updated_at TEXT
                 )
             """))
-            # Migration: 为旧库补 peak_value 列（回撤 high-water mark 持久化）
-            try:
-                conn.execute(text("ALTER TABLE account ADD COLUMN peak_value REAL"))
-            except Exception:
-                pass  # Column already exists
+            # peak_value 列：新库由 CREATE TABLE 定义；旧库由 _run_migrations v5 补。
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS update_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -326,6 +329,23 @@ class Storage:
                     report_json TEXT NOT NULL             -- 完整 ExecutionReport JSON（可审计回放）
                 )
             """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS llm_call_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    provider TEXT,                          -- claude / openai
+                    model TEXT,
+                    endpoint TEXT,                          -- call / chat / summarize_market ...
+                    prompt_excerpt TEXT,                    -- 输入摘要（审计用，不存全文省空间）
+                    raw_response TEXT,                      -- 原始输出（复盘幻觉用）
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    latency_ms INTEGER,
+                    success INTEGER DEFAULT 1,
+                    error TEXT
+                )
+            """))
+            self._run_migrations(conn)
             conn.commit()
             self._init_default_routes(conn)
 
@@ -853,6 +873,77 @@ class Storage:
                 VALUES (:data_type, :primary_source, :backup_source, 1)
             """), route)
         conn.commit()
+
+    def _run_migrations(self, conn):
+        """按序执行版本化 schema 迁移，替代裸 try/except ALTER（可审计、失败必抛）。
+
+        幂等：用 PRAGMA table_info 预检列是否已存在（新库 CREATE 已含、旧库可能已
+        通过历史 try/except 加过），存在则登记 schema_version 跳过；不存在则执行
+        ALTER 并登记。真正失败（非「列已存在」）抛 RuntimeError，不静默吞错。
+        """
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                description TEXT,
+                applied_at TEXT NOT NULL
+            )
+        """))
+        applied = {
+            r[0] for r in conn.execute(text("SELECT version FROM schema_version")).fetchall()
+        }
+        now = datetime.now().isoformat()
+        for version, desc, sql in _MIGRATIONS:
+            if version in applied:
+                continue
+            if self._column_exists(conn, sql):
+                # 旧库已通过历史 try/except 加过列，登记后跳过（幂等）
+                conn.execute(text(
+                    "INSERT OR IGNORE INTO schema_version (version, description, applied_at) "
+                    "VALUES (:v, :d, :t)"
+                ), {"v": version, "d": desc, "t": now})
+                continue
+            try:
+                conn.execute(text(sql))
+            except Exception as e:
+                raise RuntimeError(f"schema 迁移 v{version}（{desc}）失败: {e}") from e
+            conn.execute(text(
+                "INSERT INTO schema_version (version, description, applied_at) "
+                "VALUES (:v, :d, :t)"
+            ), {"v": version, "d": desc, "t": now})
+
+    @staticmethod
+    def _column_exists(conn, alter_sql: str) -> bool:
+        """从 ``ALTER TABLE t ADD COLUMN c`` 解析表/列名，预检是否已存在。"""
+        import re
+        m = re.match(
+            r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", alter_sql, re.IGNORECASE,
+        )
+        if not m:
+            return False
+        table, col = m.group(1), m.group(2)
+        cols = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+        return any(c[1] == col for c in cols)
+
+    # ── llm_call_log（LLM 调用审计 / 成本核算 / 幻觉追溯）─────────
+    def save_llm_call_log(self, rec: dict) -> None:
+        """落库一次 LLM 调用。``rec`` 缺省字段自动补 NULL/默认。"""
+        rec = dict(rec)
+        rec.setdefault("created_at", datetime.now().isoformat())
+        for k in ("provider", "model", "endpoint", "prompt_excerpt", "raw_response", "error"):
+            rec.setdefault(k, None)
+        for k in ("input_tokens", "output_tokens", "latency_ms"):
+            rec.setdefault(k, None)
+        rec.setdefault("success", 1)
+        with self.engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO llm_call_log
+                    (created_at, provider, model, endpoint, prompt_excerpt,
+                     raw_response, input_tokens, output_tokens, latency_ms, success, error)
+                VALUES
+                    (:created_at, :provider, :model, :endpoint, :prompt_excerpt,
+                     :raw_response, :input_tokens, :output_tokens, :latency_ms, :success, :error)
+            """), rec)
+            conn.commit()
 
     def get_source_routes(self) -> list:
         with self.engine.connect() as conn:

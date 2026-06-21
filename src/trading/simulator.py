@@ -5,7 +5,6 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from src.trading.portfolio import Portfolio
-from src.trading.rules import get_price_limit
 from src.data.manager import DataManager
 from src.data.storage import Storage
 from src.config import get_config
@@ -36,41 +35,37 @@ class TradingSimulator:
             return float(df.iloc[-1]["close"])
         return None
 
+    def _get_prev_close(self, code: str) -> Optional[float]:
+        """本地最新日K收盘价，供 Portfolio 涨跌停校验（无数据返回 None → 不拦截）。"""
+        df = self.dm.storage.get_daily_bars(code)
+        if not df.empty:
+            return float(df.iloc[-1]["close"])
+        return None
+
     def place_buy(self, code: str, name: str, quantity: int, price: float = None) -> dict:
-        """下买单，price为None时用当前市价"""
+        """下买单，price为None时用当前市价。
+
+        涨跌停校验由 :meth:`Portfolio.buy` 兜底（传 prev_close 避免重复查库）。
+        """
         trade_date = date.today().isoformat()
         if price is None:
             price = self.get_current_price(code)
             if price is None:
                 return {"success": False, "msg": f"无法获取{code}价格"}
 
-        # 检查涨跌停
-        df = self.dm.storage.get_daily_bars(code)
-        if not df.empty:
-            prev_close = float(df.iloc[-1]["close"])
-            limit_up, limit_down = get_price_limit(code, prev_close)
-            if price >= limit_up:
-                return {"success": False, "msg": f"{code}已涨停（{limit_up}），无法买入"}
-
-        return self.portfolio.buy(code, name, price, quantity, trade_date)
+        return self.portfolio.buy(code, name, price, quantity, trade_date,
+                                  prev_close=self._get_prev_close(code))
 
     def place_sell(self, code: str, quantity: int, price: float = None) -> dict:
-        """下卖单"""
+        """下卖单。跌停校验由 :meth:`Portfolio.sell` 兜底。"""
         trade_date = date.today().isoformat()
         if price is None:
             price = self.get_current_price(code)
             if price is None:
                 return {"success": False, "msg": f"无法获取{code}价格"}
 
-        # 检查跌停
-        df = self.dm.storage.get_daily_bars(code)
-        if not df.empty:
-            prev_close = float(df.iloc[-1]["close"])
-            _, limit_down = get_price_limit(code, prev_close)
-            if price <= limit_down:
-                return {"success": False, "msg": f"{code}已跌停（{limit_down}），无法卖出"}
-
-        return self.portfolio.sell(code, price, quantity, trade_date)
+        return self.portfolio.sell(code, price, quantity, trade_date,
+                                   prev_close=self._get_prev_close(code))
 
     def refresh_positions(self):
         """刷新持仓市价"""

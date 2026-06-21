@@ -100,7 +100,7 @@ class DataManager:
             sectors: [{name, pct_chg, up_count, down_count}],
             sector_advances, sector_declines, source}``
         """
-        from src.analysis.sentiment import INDEX_CODES
+        from src.data.market_indices import INDEX_CODES
         index_codes = index_codes or INDEX_CODES
 
         end_date = _latest_possible_trading_day().isoformat()
@@ -210,7 +210,7 @@ class DataManager:
         000001 指数=上证 sh 而非平安银行 sz），复用 ``TencentFetcher.fetch_raw`` 解析。
         失败只 warning，不抛；不覆盖东财已取到的指数。
         """
-        from src.analysis.sentiment import INDEX_TENCENT_SYMBOLS
+        from src.data.market_indices import INDEX_TENCENT_SYMBOLS
         tencent = self._fetchers.get("tencent")
         if tencent is None:
             return
@@ -253,7 +253,6 @@ class DataManager:
             source}``。``reference`` 仅 use_neutral=False 的指标用到。
         """
         import akshare as ak
-        from src.analysis.macro import INDICATOR_NAMES
 
         ind: dict = {"liquidity": {}, "capital": {}, "fundamental": {}, "external": {}}
         as_of_dates: list[str] = []
@@ -452,7 +451,6 @@ class DataManager:
         return {
             "as_of": as_of,
             "indicators": ind,
-            "indicator_names": INDICATOR_NAMES,
             "source": "akshare",
         }
 
@@ -478,7 +476,27 @@ class DataManager:
             logger.info(f"增量拉取 {code} 日K线: {fetch_start} ~ {end_date}")
             df_new = self.router.call("daily_bars", code, fetch_start, end_date)
             if not df_new.empty:
+                # 复权漂移检测：前复权(qfq)价在除权日会被数据源整体重算。增量拉取
+                # 只补新日期，不刷新 latest 之前的历史价 → 除权次日本地出现虚假向下
+                # 跳空、MA/MACD/KDJ 信号失真。若 overlap 日(latest) 的 close 与本地
+                # 旧值不一致，说明历史复权价被重算 → 触发全量重拉刷新整段历史。
+                need_full_refresh = False
+                if latest:
+                    try:
+                        existing = self.storage.get_daily_bars(code, latest, latest)
+                        old_close = float(existing.iloc[-1]["close"]) if not existing.empty else None
+                    except Exception:
+                        old_close = None
+                    if old_close is not None:
+                        overlap = df_new[df_new["trade_date"].astype(str) == str(latest)]
+                        if not overlap.empty and abs(float(overlap.iloc[-1]["close"]) - old_close) > 0.001:
+                            need_full_refresh = True
                 self.storage.upsert_daily_bars(df_new)
+                if need_full_refresh:
+                    logger.warning(f"{code} 检测到复权价漂移（{latest} 收盘被重算），全量重拉")
+                    df_full = self.router.call("daily_bars", code, start_date, end_date)
+                    if not df_full.empty:
+                        self.storage.upsert_daily_bars(df_full)
 
         return self.storage.get_daily_bars(code, start_date, end_date)
 

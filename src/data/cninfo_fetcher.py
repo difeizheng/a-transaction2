@@ -78,9 +78,13 @@ class CninfoFetcher(BaseFetcher):
 
         rows = []
         for ann in announcements:
+            # 巨潮无摘要字段，公告正文需 adjunctUrl 单独请求（每条一个请求，成本高，
+            # 属后续优化）。用标题兜底避免 content 全空——路由 announcements 在 tushare
+            # 不可用切到 cninfo 时，下游 LLM 至少有文本可读（而非空串退化为只看标题）。
+            title = ann.get("announcementTitle", "")
             rows.append({
-                "title": ann.get("announcementTitle", ""),
-                "content": "",  # 公告正文需单独请求，此处留空
+                "title": title,
+                "content": title,
                 "publish_time": ann.get("announcementTime", ""),
                 "source": "巨潮资讯",
                 "related_codes": code,

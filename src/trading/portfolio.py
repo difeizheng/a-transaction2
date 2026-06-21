@@ -4,7 +4,10 @@ from datetime import date
 from typing import Dict, Optional
 import pandas as pd
 
-from src.trading.rules import calc_commission, round_to_lot, is_t1_available
+from src.trading.rules import (
+    calc_commission, round_to_lot, is_t1_available,
+    is_at_limit_up, is_at_limit_down,
+)
 from src.data.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -56,11 +59,21 @@ class Portfolio:
     def total_value(self, prices: Dict[str, float] = None) -> float:
         return self._cash + self.market_value(prices)
 
-    def buy(self, code: str, name: str, price: float, quantity: int, trade_date: str) -> dict:
-        """执行买入，返回成交记录"""
+    def buy(self, code: str, name: str, price: float, quantity: int,
+            trade_date: str, prev_close: float = None) -> dict:
+        """执行买入，返回成交记录。
+
+        ``prev_close`` 为昨收价（用于涨跌停校验）；调用方可显式传入避免重复查库，
+        未传则自查本地最新日K。无历史数据（新上市/空库）时不拦截。
+        """
         quantity = round_to_lot(quantity)
         if quantity <= 0:
             return {"success": False, "msg": "数量不足1手（100股）"}
+
+        # 涨跌停底层兜底：防绕过 Simulator 的路径（UI 手动加仓等）按不可成交价建仓。
+        prev_close = self._resolve_prev_close(code, prev_close)
+        if prev_close > 0 and is_at_limit_up(code, prev_close, price):
+            return {"success": False, "msg": f"{code}已涨停（{price}≥涨停价），无法买入"}
 
         amount = price * quantity
         commission = calc_commission(amount, is_buy=True)
@@ -76,10 +89,15 @@ class Portfolio:
             pos = self._positions[code]
             old_qty = pos["quantity"]
             old_cost = pos["cost_price"]
+            old_available = pos.get("available", 0)
             new_qty = old_qty + quantity
             pos["cost_price"] = (old_qty * old_cost + amount) / new_qty
             pos["quantity"] = new_qty
-            pos["available"] = pos.get("available", 0)  # 当日买入不可卖
+            # 新买入部分受 T+1 约束：available 维持旧可卖数（不含本次加仓），
+            # 并把 buy_date 更新为本次交易日——否则 end_of_day 会因 buy_date 仍是
+            # 首次买入日而误判，把当日加仓部分也一并解锁（T+0 违规）。
+            pos["available"] = old_available
+            pos["buy_date"] = trade_date
         else:
             self._positions[code] = {
                 "code": code, "name": name,
@@ -102,8 +120,16 @@ class Portfolio:
         self.storage.save_order(order)
         return {"success": True, "order": order}
 
-    def sell(self, code: str, price: float, quantity: int, trade_date: str) -> dict:
-        """执行卖出"""
+    def sell(self, code: str, price: float, quantity: int,
+             trade_date: str, prev_close: float = None) -> dict:
+        """执行卖出。``prev_close`` 语义同 :meth:`buy`。"""
+        # 跌停底层兜底：价格非法（跌停卖不出）先于持仓充足性校验——即使未持仓，
+        # 跌停价卖单也按"跌停"拒绝（与 simulator 原行为一致；也是
+        # test_sell_above_limit_down_passes_limit_check 期望的校验顺序）。
+        prev_close = self._resolve_prev_close(code, prev_close)
+        if prev_close > 0 and is_at_limit_down(code, prev_close, price):
+            return {"success": False, "msg": f"{code}已跌停（{price}≤跌停价），无法卖出"}
+
         pos = self._positions.get(code)
         if not pos:
             return {"success": False, "msg": f"未持有{code}"}
@@ -161,6 +187,22 @@ class Portfolio:
     def _save_position(self, code: str):
         if code in self._positions:
             self.storage.upsert_position(self._positions[code])
+
+    def _resolve_prev_close(self, code: str, prev_close: float = None) -> float:
+        """涨跌停校验用的昨收价：调用方传入优先，否则查本地最新日K收盘价。
+
+        无历史数据（新上市股票、测试空库）时返回 0.0 → 调用方据此跳过涨跌停
+        校验，避免误拦正常下单。查库异常同样降级为 0.0 并 warning。
+        """
+        if prev_close is not None:
+            return float(prev_close)
+        try:
+            df = self.storage.get_daily_bars(code)
+            if not df.empty:
+                return float(df.iloc[-1]["close"])
+        except Exception as e:
+            logger.warning(f"取 {code} 昨收失败（跳过涨跌停校验）: {e}")
+        return 0.0
 
     def summary(self, prices: Dict[str, float] = None) -> dict:
         mv = self.market_value(prices)

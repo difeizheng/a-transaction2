@@ -17,13 +17,10 @@ import math
 import statistics
 from typing import Optional
 
-# 跟踪的指数代码与中文名（DataManager.get_market_snapshot 也复用此映射）
-INDEX_CODES = {
-    "000300": "沪深300",
-    "000001": "上证指数",
-    "399006": "创业板指",
-    "000905": "中证500",
-}
+# 指数代码 / 腾讯备源 symbol 下沉到 data 层（src/data/market_indices.py），消除
+# data→analysis 反向依赖；此处 re-export 保持向后兼容（旧代码仍可
+# `from src.analysis.sentiment import INDEX_CODES`）。
+from src.data.market_indices import INDEX_CODES, INDEX_TENCENT_SYMBOLS
 
 # 指数权重（和归一）。沪深300 最能代表大盘 → 权重最高。
 INDEX_WEIGHTS = {
@@ -33,15 +30,7 @@ INDEX_WEIGHTS = {
     "000905": 0.20,
 }
 
-# 腾讯实时行情指数 symbol 映射（东财日K push2 被限流时的备源）。
-# 注意：不能套用个股规则（6→sh/其他→sz）——000001 在指数里是上证指数(sh)而非
-# 平安银行(sz)，必须显式映射交易所前缀。
-INDEX_TENCENT_SYMBOLS = {
-    "000300": "sh000300",  # 沪深300（上交所）
-    "000001": "sh000001",  # 上证指数（上交所）
-    "399006": "sz399006",  # 创业板指（深交所）
-    "000905": "sh000905",  # 中证500（上交所）
-}
+# （INDEX_TENCENT_SYMBOLS 已由文件顶部 re-export 从 src.data.market_indices 引入）
 
 INDEX_PCT_SCALE = 8.0        # 1 个指数 +2% → 该指数贡献约 +16 原始分
 SECTOR_MEDIAN_SCALE = 6.0
