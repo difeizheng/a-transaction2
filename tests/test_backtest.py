@@ -10,47 +10,61 @@ import backtrader as bt
 from src.backtest.engine import AShareCommissionInfo, BacktestEngine
 
 
-# ── AShareCommissionInfo 手续费 ─────────────────────────────────
+# ── AShareCommissionInfo 手续费（佣金+过户费双边 + 卖出印花税）─────
 class TestAShareCommissionInfo:
     @pytest.mark.unit
     def test_buy_commission_no_stamp_duty(self):
-        # 买入 1000 元：佣金 1000×0.0003=0.3，无印花税
+        # 买入 1000 元：佣金 1000×0.0003=0.3 + 过户费 1000×0.0001=0.1 = 0.4（买入无印花税）
         # 注意：_getcommission 返回原始计算值，最低 5 元由 backtrader 的 getcommission() 应用
         comm = AShareCommissionInfo(commission=0.0003, stamp_duty=0.001)
         fee = comm._getcommission(size=100, price=10.0)  # 买入 100 股 × 10 元
-        assert fee == pytest.approx(0.3, abs=0.01)  # 1000 × 0.0003
+        assert fee == pytest.approx(0.4, abs=0.01)  # 佣金 0.3 + 过户费 0.1
 
     @pytest.mark.unit
     def test_sell_commission_includes_stamp_duty(self):
-        # 卖出 1000 元：佣金 0.3 + 印花税 1000×0.001=1 → 总 1.3
+        # 卖出 1000 元：佣金 0.3 + 过户费 0.1 + 印花税 1000×0.001=1 → 总 1.4
         comm = AShareCommissionInfo(commission=0.0003, stamp_duty=0.001)
         fee = comm._getcommission(size=-100, price=10.0)  # 卖出 100 股 × 10 元
-        assert fee == pytest.approx(1.3, abs=0.01)  # 佣金 0.3 + 印花税 1
+        assert fee == pytest.approx(1.4, abs=0.01)  # 佣金 0.3 + 过户 0.1 + 印花税 1
 
     @pytest.mark.unit
     def test_large_amount_commission_respects_rate(self):
-        # 买入 10 万元：佣金 100000×0.0003=30，无印花税
+        # 买入 10 万元：佣金 30 + 过户费 10 = 40（买入无印花税）
         comm = AShareCommissionInfo(commission=0.0003, stamp_duty=0.001)
         fee = comm._getcommission(size=10000, price=10.0)  # 10000 股 × 10 元
-        assert fee == pytest.approx(30.0, abs=0.01)
+        assert fee == pytest.approx(40.0, abs=0.01)
 
     @pytest.mark.unit
     def test_large_sell_commission_includes_both(self):
-        # 卖出 10 万元：佣金 30 + 印花税 100 → 总 130
+        # 卖出 10 万元：佣金 30 + 过户费 10 + 印花税 100 → 总 140
         comm = AShareCommissionInfo(commission=0.0003, stamp_duty=0.001)
         fee = comm._getcommission(size=-10000, price=10.0)
-        assert fee == pytest.approx(130.0, abs=0.01)
+        assert fee == pytest.approx(140.0, abs=0.01)
 
     @pytest.mark.unit
     def test_custom_rates(self):
-        # 自定义费率：佣金 0.001，印花税 0.002
+        # 自定义费率：佣金 0.001，印花税 0.002（过户费仍用默认 0.0001）
         comm = AShareCommissionInfo(commission=0.001, stamp_duty=0.002)
-        # 买入 1 万元：佣金 10000×0.001=10
+        # 买入 1 万元：佣金 10 + 过户费 1 = 11
         fee_buy = comm._getcommission(size=1000, price=10.0)
-        assert fee_buy == pytest.approx(10.0, abs=0.01)
-        # 卖出 1 万元：佣金 10 + 印花税 10000×0.002=20 → 总 30
+        assert fee_buy == pytest.approx(11.0, abs=0.01)
+        # 卖出 1 万元：佣金 10 + 过户费 1 + 印花税 20 → 总 31
         fee_sell = comm._getcommission(size=-1000, price=10.0)
-        assert fee_sell == pytest.approx(30.0, abs=0.01)
+        assert fee_sell == pytest.approx(31.0, abs=0.01)
+
+    @pytest.mark.unit
+    def test_transfer_fee_is_bilateral(self):
+        # 过户费双边：买入也收（与 trading.rules.calc_commission 口径一致）
+        comm = AShareCommissionInfo(commission=0.0003, stamp_duty=0.0005)
+        # 买入 10 万：佣金 30 + 过户 10 = 40（无印花税）
+        assert comm._getcommission(size=10000, price=10.0) == pytest.approx(40.0, abs=0.01)
+
+    @pytest.mark.unit
+    def test_default_stamp_duty_is_new_rate(self):
+        # 防回归：默认印花税必须是 0.0005（2023.8.28 起），不是旧 0.001
+        comm = AShareCommissionInfo()
+        assert comm.p.stamp_duty == 0.0005
+        assert comm.p.transfer_fee == 0.0001
 
 
 # ── BacktestEngine 端到端 ───────────────────────────────────────

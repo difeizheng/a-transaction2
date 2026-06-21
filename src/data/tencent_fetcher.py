@@ -60,6 +60,22 @@ class TencentFetcher(BaseFetcher):
         df = pd.DataFrame(results)
         return df[["code", "name", "price", "pct_chg", "volume", "amount"]]
 
+    def fetch_raw(self, symbols: list) -> list:
+        """取**已带交易所前缀**(sh/sz/bj)的 symbol 实时行情，返回解析后的行列表。
+
+        供指数备源用：指数 symbol 不能套用 ``_to_tencent_symbol`` 个股规则
+        （000001 在指数里是上证指数 sh，而非平安银行 sz），调用方负责传正确前缀。
+        返回行含 code(纯数字)/name/price/pct_chg/volume/amount。
+        """
+        if not symbols:
+            return []
+        resp = self._session.get(
+            _TENCENT_URL.format(symbols=",".join(symbols)),
+            timeout=self._timeout,
+        )
+        resp.encoding = "gbk"
+        return self._parse_response(resp.text)
+
     def get_stock_list(self) -> pd.DataFrame:
         raise NotImplementedError("腾讯财经不提供股票列表接口")
 

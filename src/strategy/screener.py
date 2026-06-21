@@ -7,20 +7,29 @@ from src.strategy.base import BaseStrategy, ScreenResult
 from src.strategy.technical import MACrossStrategy, MACDGoldenCrossStrategy, KDJOversoldStrategy, BollingerBreakoutStrategy
 from src.strategy.fundamental import LowValuationStrategy, HighGrowthStrategy, IndustryLeaderStrategy
 from src.strategy.multifactor import MultiFactorStrategy
+from src.strategy.smallcap import SmallCapStrategy
 
 logger = logging.getLogger(__name__)
 
-# 所有可用策略注册表
+# 所有可用策略注册表。is_deprecated=True 的策略保留可复现历史，但从默认策略集/UI 下拉
+# 中排除（见 list_strategies active_only）——这些策略在 A 股机构化后失效（审计报告 P1-D）。
 STRATEGY_REGISTRY: dict = {
     "ma_cross": MACrossStrategy,
     "macd_golden": MACDGoldenCrossStrategy,
-    "kdj_oversold": KDJOversoldStrategy,
-    "boll_breakout": BollingerBreakoutStrategy,
+    "kdj_oversold": KDJOversoldStrategy,        # is_deprecated=True
+    "boll_breakout": BollingerBreakoutStrategy,  # is_deprecated=True
     "low_valuation": LowValuationStrategy,
     "high_growth": HighGrowthStrategy,
     "industry_leader": IndustryLeaderStrategy,
+    "small_cap": SmallCapStrategy,
     "multi_factor": MultiFactorStrategy,
 }
+
+# 默认策略集：UI 下拉/AutoTrader 默认勾选。排除两个已失效技术策略。
+DEFAULT_STRATEGY_KEYS = [
+    "ma_cross", "macd_golden", "low_valuation", "high_growth",
+    "industry_leader", "small_cap", "multi_factor",
+]
 
 
 class Screener:
@@ -106,9 +115,18 @@ class Screener:
         return ranks.tolist()
 
     @staticmethod
-    def list_strategies() -> dict:
-        return {k: v.description if hasattr(v, 'description') else k
-                for k, v in STRATEGY_REGISTRY.items()}
+    def list_strategies(active_only: bool = True) -> dict:
+        """返回 {key: description}。
+
+        :param active_only: True（默认）排除 ``is_deprecated=True`` 的失效策略；
+            False 返回全部（含失效，供历史复现/高级用户）。
+        """
+        out = {}
+        for k, cls in STRATEGY_REGISTRY.items():
+            if active_only and getattr(cls, "is_deprecated", False):
+                continue
+            out[k] = cls.description if hasattr(cls, "description") else k
+        return out
 
     @staticmethod
     def create_strategy(name: str, **kwargs) -> BaseStrategy:

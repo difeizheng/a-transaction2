@@ -4,7 +4,7 @@ from typing import List
 import pandas as pd
 import pandas_ta as ta
 
-from src.strategy.base import BaseStrategy, ScreenResult, StockEvaluation, ConditionCheck
+from src.strategy.base import BaseStrategy, ScreenResult, StockEvaluation, ConditionCheck, ExitSignal
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,40 @@ class MACrossStrategy(BaseStrategy):
                 trace_log="\n".join(trace)
             )
 
+    def evaluate_exit(self, code: str, name: str, data_manager) -> ExitSignal:
+        """对称出场：入场要求多头排列（MA5>MA10>MA20>MA60 且 close>MA20）；
+        出场即趋势破位——close 跌破 MA20，或 MA5 下穿 MA10（短期转弱）。"""
+        try:
+            df = data_manager.get_daily_bars(code)
+            if len(df) < self.min_bars:
+                return ExitSignal(code=code, name=name, strategy_key="ma_cross",
+                                  should_exit=False, reason="K线不足")
+            df = _calc_indicators(df)
+            last = df.iloc[-1]
+            if pd.isna(last["ma60"]) or pd.isna(last["ma20"]) or pd.isna(last["ma10"]) or pd.isna(last["ma5"]):
+                return ExitSignal(code=code, name=name, strategy_key="ma_cross",
+                                  should_exit=False, reason="均线数据不足")
+            ma5, ma10, ma20 = float(last["ma5"]), float(last["ma10"]), float(last["ma20"])
+            close = float(last["close"])
+            break_support = close < ma20        # 跌破 MA20 支撑
+            short_reversal = ma5 <= ma10        # 短期均线反向
+            should_exit = break_support or short_reversal
+            reason = []
+            if break_support:
+                reason.append(f"close {close:.2f} 跌破 MA20 {ma20:.2f}")
+            if short_reversal:
+                reason.append(f"MA5 {ma5:.2f} ≤ MA10 {ma10:.2f}")
+            return ExitSignal(
+                code=code, name=name, strategy_key="ma_cross",
+                should_exit=should_exit,
+                reason=("趋势破位：" + "；".join(reason)) if should_exit else "多头排列未破",
+                indicators={"MA5": round(ma5, 2), "MA10": round(ma10, 2),
+                            "MA20": round(ma20, 2), "close": round(close, 2)},
+            )
+        except Exception as e:
+            return ExitSignal(code=code, name=name, strategy_key="ma_cross",
+                              should_exit=False, reason=f"计算异常: {e}")
+
 class MACDGoldenCrossStrategy(BaseStrategy):
     """MACD金叉策略：DIF上穿DEA，且MACD柱由负转正"""
 
@@ -221,11 +255,48 @@ class MACDGoldenCrossStrategy(BaseStrategy):
                                    trace_log="\n".join(trace))
 
 
+    def evaluate_exit(self, code: str, name: str, data_manager) -> ExitSignal:
+        """对称出场：入场要求 DIF>DEA（金叉后信号有效）；出场即 DIF 下穿 DEA（死叉）——
+        与入场「当前 DIF>DEA」严格对称反向。"""
+        try:
+            df = data_manager.get_daily_bars(code)
+            if len(df) < 60:
+                return ExitSignal(code=code, name=name, strategy_key="macd_golden",
+                                  should_exit=False, reason="K线不足60条")
+            df = _calc_indicators(df)
+            dif_col = [c for c in df.columns if c.startswith("MACD_") and "h" not in c and "s" not in c]
+            dea_col = [c for c in df.columns if c.startswith("MACDs_")]
+            if not dif_col or not dea_col:
+                return ExitSignal(code=code, name=name, strategy_key="macd_golden",
+                                  should_exit=False, reason="MACD指标计算失败")
+            dif, dea = df[dif_col[0]], df[dea_col[0]]
+            dif_val, dea_val = float(dif.iloc[-1]), float(dea.iloc[-1])
+            # 死叉：当前 DIF<=DEA（入场要求 DIF>DEA，对称反向）
+            should_exit = dif_val <= dea_val
+            reason = (f"DIF {dif_val:.4f} ≤ DEA {dea_val:.4f}（死叉，信号失效）"
+                      if should_exit else f"DIF {dif_val:.4f} > DEA {dea_val:.4f}（信号仍在）")
+            return ExitSignal(
+                code=code, name=name, strategy_key="macd_golden",
+                should_exit=should_exit, reason=reason,
+                indicators={"DIF": round(dif_val, 4), "DEA": round(dea_val, 4)},
+            )
+        except Exception as e:
+            return ExitSignal(code=code, name=name, strategy_key="macd_golden",
+                              should_exit=False, reason=f"计算异常: {e}")
+
+
 class KDJOversoldStrategy(BaseStrategy):
-    """KDJ超卖反弹策略：K<30且D<30，且K上穿D"""
+    """KDJ超卖反弹策略：K<30且D<30，且K上穿D
+
+    ⚠️ **已标记为失效（is_deprecated=True）**：KDJ 是 90 年代美股指标，A 股 2017 机构化后
+    大面积失效；超卖反弹在 A 股易踩「价值陷阱」（低估值继续杀估值）。保留代码供历史复现，
+    但从默认策略集/UI 下拉中排除（见 screener.list_strategies active_only）。详见审计报告 P1-D。
+    """
 
     name = "kdj_oversold"
-    description = "KDJ超卖反弹（K<30且K上穿D）"
+    description = "KDJ超卖反弹（K<30且K上穿D）【已失效，默认排除】"
+    is_deprecated = True
+    deprecation_reason = "90年代美股指标，A股机构化后大面积失效，超卖反弹易踩价值陷阱"
 
     def __init__(self, oversold_threshold: int = 30, lookback: int = 3):
         self.oversold_threshold = oversold_threshold
@@ -321,10 +392,17 @@ class KDJOversoldStrategy(BaseStrategy):
 
 
 class BollingerBreakoutStrategy(BaseStrategy):
-    """布林带突破策略：价格从下轨反弹，突破中轨"""
+    """布林带突破策略：价格从下轨反弹，突破中轨
+
+    ⚠️ **已标记为失效（is_deprecated=True）**：布林带突破在 A 股震荡市频繁假突破、趋势市
+    踏空，未配合成交量/趋势过滤时胜率偏低。保留代码供历史复现，从默认策略集/UI 下拉中
+    排除。详见审计报告 P1-D。
+    """
 
     name = "boll_breakout"
-    description = "布林带下轨反弹突破中轨"
+    description = "布林带下轨反弹突破中轨【已失效，默认排除】"
+    is_deprecated = True
+    deprecation_reason = "A股震荡市频繁假突破，未配合量能/趋势过滤时胜率低"
 
     def __init__(self, lookback: int = 5):
         self.lookback = lookback

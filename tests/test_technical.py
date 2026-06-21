@@ -159,3 +159,64 @@ class TestStrategyEdgeCases:
         for cls in (MACrossStrategy, MACDGoldenCrossStrategy,
                     KDJOversoldStrategy, BollingerBreakoutStrategy):
             assert cls().supports_evaluate() is True, f"{cls.__name__} 未实现 evaluate_stock"
+
+
+# ── 入场出场对称化（evaluate_exit）──────────────────────────────
+class TestSymmetricExit:
+    """审计 P2-E：入场条件的反向触发 = 出场。验证出场与入场严格对称。"""
+
+    @pytest.mark.unit
+    def test_ma_cross_exit_when_trend_breaks(self):
+        # 持续上涨后突然下跌破位：close 跌破 MA20 / MA5 下穿 MA10 → 出场
+        # 构造 70 日稳定上涨（满足入场），末尾快速回落制造破位
+        up = list(np.linspace(10.0, 20.0, 65))
+        down = [20.0, 18.0, 15.5, 12.5, 11.0]  # 5 日急跌，跌破均线
+        bars = _make_bars(up + down)
+        dm = _FakeDM(bars)
+        sig = MACrossStrategy().evaluate_exit("000001", "X", dm)
+        assert sig.should_exit is True
+        assert "破位" in sig.reason or "跌破" in sig.reason or "MA10" in sig.reason
+
+    @pytest.mark.unit
+    def test_ma_cross_no_exit_in_uptrend(self):
+        # 持续上涨、多头排列完好 → 不出场
+        bars = _make_bars(list(np.linspace(10.0, 20.0, 70)))
+        dm = _FakeDM(bars)
+        sig = MACrossStrategy().evaluate_exit("000001", "X", dm)
+        assert sig.should_exit is False
+
+    @pytest.mark.unit
+    def test_ma_cross_insufficient_bars_no_exit(self):
+        bars = _make_bars([10.0, 11.0, 12.0])  # 不足 min_bars(60)
+        dm = _FakeDM(bars)
+        sig = MACrossStrategy().evaluate_exit("000001", "X", dm)
+        assert sig.should_exit is False
+
+    @pytest.mark.unit
+    def test_macd_exit_on_death_cross(self):
+        # DIF 下穿 DEA（死叉）→ 出场（与入场 DIF>DEA 对称）
+        # 构造先涨后跌，末段 MACD 死叉
+        prices = list(np.linspace(10.0, 16.0, 50)) + list(np.linspace(16.0, 12.0, 20))
+        bars = _make_bars(prices)
+        dm = _FakeDM(bars)
+        sig = MACDGoldenCrossStrategy().evaluate_exit("000001", "X", dm)
+        # 末段下跌 → DIF 应已下穿 DEA
+        assert sig.should_exit is True
+        assert "死叉" in sig.reason
+
+    @pytest.mark.unit
+    def test_macd_no_exit_when_signal_alive(self):
+        # 持续上涨 → DIF>DEA 信号仍在 → 不出场
+        bars = _make_bars(list(np.linspace(10.0, 20.0, 70)))
+        dm = _FakeDM(bars)
+        sig = MACDGoldenCrossStrategy().evaluate_exit("000001", "X", dm)
+        assert sig.should_exit is False
+
+    @pytest.mark.unit
+    def test_deprecated_strategies_have_default_exit(self):
+        # 已失效策略未定义出场 → 默认 should_exit=False（不报错）
+        bars = _make_bars(list(np.linspace(10.0, 15.0, 70)))
+        dm = _FakeDM(bars)
+        for cls in (KDJOversoldStrategy, BollingerBreakoutStrategy):
+            sig = cls().evaluate_exit("000001", "X", dm)
+            assert sig.should_exit is False

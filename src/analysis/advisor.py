@@ -1,6 +1,7 @@
 """综合建议生成器：结合选股信号+新闻+LLM分析"""
 import json
 import logging
+from datetime import date
 from typing import List
 import pandas as pd
 
@@ -17,10 +18,125 @@ class Advisor:
         self.dm = data_manager
 
     def analyze_market(self) -> dict:
-        """分析整体市场情绪"""
+        """分析整体市场情绪：真实数据算温度 + LLM 定性总结 + 存库。
+
+        温度由 ``sentiment.compute_market_temperature`` 从指数涨跌 + 板块轮动
+        确定性算出（不再由 LLM 凭空给分）；LLM 仅产出 100 字定性总结与关键事件
+        （**总 LLM 调用 = 1**，与改造前一致，积分不增）。结果按交易日存库，
+        UI 可画情绪温度趋势。
+
+        Returns:
+            富 dict 供 UI 全量渲染——temperature/label/components（数据驱动）+
+            indices/sectors（行情明细）+ summary/key_events（LLM 文字）+ snapshot_date。
+        """
+        from src.analysis import sentiment
+
+        snapshot = self.dm.get_market_snapshot()
+        index_moves = {code: v["pct_chg"] for code, v in snapshot["indices"].items()}
+        sectors = snapshot["sectors"]
+        sector_returns = [s["pct_chg"] for s in sectors]
+
+        temp = sentiment.compute_market_temperature(
+            index_moves,
+            sector_returns,
+            sector_advances=snapshot.get("sector_advances"),
+            sector_declines=snapshot.get("sector_declines"),
+        )
+
+        # LLM 定性总结（1 次调用）
         news_df = self.dm.get_news(limit=30)
         news_list = news_df.to_dict("records") if not news_df.empty else []
-        return self.llm.analyze_news_sentiment(news_list)
+        top_sectors = [s["name"] for s in sorted(sectors, key=lambda x: x["pct_chg"], reverse=True)[:5]]
+        prose = self.llm.summarize_market(
+            news_list,
+            temp["temperature"],
+            temp["label"],
+            index_moves=index_moves,
+            top_sectors=top_sectors,
+        )
+
+        snapshot_date = snapshot.get("as_of") or date.today().isoformat()
+        sector_summary = {
+            "median": float(pd.Series(sector_returns).median()) if sector_returns else 0.0,
+            "top": [{"name": s["name"], "pct_chg": s["pct_chg"]}
+                    for s in sorted(sectors, key=lambda x: x["pct_chg"], reverse=True)[:5]],
+            "bottom": [{"name": s["name"], "pct_chg": s["pct_chg"]}
+                       for s in sorted(sectors, key=lambda x: x["pct_chg"])[:5]],
+        }
+
+        record = {
+            "snapshot_date": snapshot_date,
+            "temperature": temp["temperature"],
+            "label": temp["label"],
+            "index_moves_json": index_moves,
+            "sector_summary_json": sector_summary,
+            "summary": prose.get("summary", ""),
+            "key_events_json": prose.get("key_events", []),
+        }
+        try:
+            self.dm.storage.save_market_sentiment(record)
+        except Exception as e:
+            logger.warning(f"市场情绪快照存库失败: {e}")
+
+        return {
+            **record,
+            "components": temp["components"],
+            "indices": snapshot["indices"],
+            "sectors": sectors,
+            "as_of": snapshot.get("as_of"),
+            "source": snapshot.get("source"),
+        }
+
+    def analyze_macro(self) -> dict:
+        """分析宏观态势：真实四支柱数据算分 + LLM 政策面定性 + 存库。
+
+        态势分由 ``macro.compute_macro_stance`` 从流动性 / 资金面 / 基本面 / 外部
+        确定性算出（**不再由 LLM 给分**）；LLM 仅产出综合定性 + 政策面解读 + 关键
+        风险（政策面是纯函数算不了的，正是 LLM 在宏观里唯一不可替代的贡献）。
+        **总 LLM 调用 = 1**，积分不增。结果按交易日存库，UI 可画 regime 趋势。
+
+        Returns:
+            富 dict 供 UI 全量渲染——score/label/stance/components/indicators（数据
+            驱动）+ summary/policy_read/key_risks（LLM 文字）+ indicators_meta（带
+            as_of 的原始指标，UI 展示用）+ snapshot_date。
+        """
+        from src.analysis import macro
+
+        snapshot = self.dm.get_macro_snapshot()
+        result = macro.compute_macro_stance(snapshot["indicators"])
+
+        # LLM 政策面定性（1 次调用）
+        news_df = self.dm.get_news(limit=30)
+        news_list = news_df.to_dict("records") if not news_df.empty else []
+        prose = self.llm.summarize_macro(
+            result["score"], result["label"], result["components"],
+            snapshot["indicators"], news_list,
+        )
+
+        snapshot_date = snapshot.get("as_of") or date.today().isoformat()
+        record = {
+            "snapshot_date": snapshot_date,
+            "score": result["score"],
+            "label": result["label"],
+            "stance": result["stance"],
+            "components_json": result["components"],
+            "indicators_json": result["indicators"],
+            "summary": prose.get("summary", ""),
+            "key_risks_json": prose.get("key_risks", []),
+        }
+        try:
+            self.dm.storage.save_macro_snapshot(record)
+        except Exception as e:
+            logger.warning(f"宏观态势快照存库失败: {e}")
+
+        return {
+            **record,
+            "policy_read": prose.get("policy_read", ""),
+            "indicators_meta": snapshot["indicators"],   # 带 latest/reference/as_of，UI 展示用
+            "indicator_names": snapshot.get("indicator_names", {}),
+            "as_of": snapshot.get("as_of"),
+            "source": snapshot.get("source"),
+        }
 
     def analyze_stock(self, screen_result: ScreenResult) -> dict:
         """对单只选中股票做深度分析，返回建议"""

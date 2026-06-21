@@ -21,6 +21,35 @@ def _insert_or_ignore(table, conn, keys, data_iter):
     conn.execute(stmt, [dict(zip(keys, row)) for row in data_iter])
 
 
+def _make_upsert_method(pk_cols):
+    """生成 pandas to_sql ``method``：主键冲突时**更新**所有非主键列（而非 IGNORE）。
+
+    用于 daily_bars：前复权(qfq)历史价会随除权分红整体重算，INSERT OR IGNORE
+    会保留陈旧价格 → 除权日前后虚假跳空、技术信号失真。改为 ON CONFLICT DO
+    UPDATE，使全量重拉（``force_refresh_stock`` / ``batch_update_bars_v2(full)``）
+    能刷新历史复权价。
+
+    显式传 ``pk_cols``（列名字符串）而非依赖 pandas 反射 Table 的 primary_key
+    ——反射在 append 模式下不可靠（拿不到 PK），会导致 ON CONFLICT 子句丢失、
+    退化为普通 INSERT 在重复键上报 UNIQUE 冲突。
+    """
+    def _method(table, conn, keys, data_iter):
+        data = [dict(zip(keys, row)) for row in data_iter]
+        if not data:
+            return
+        sa_table = table.table
+        stmt = sqlite_insert(sa_table).values(data)
+        # excluded 命名空间引用「新值」（ON CONFLICT DO UPDATE 标准写法）
+        update_cols = {c: getattr(stmt.excluded, c) for c in keys if c not in pk_cols}
+        if update_cols:
+            stmt = stmt.on_conflict_do_update(index_elements=pk_cols, set_=update_cols)
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
+        conn.execute(stmt)
+
+    return _method
+
+
 def _engine(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return create_engine(
@@ -51,18 +80,30 @@ class Storage:
                     trade_date TEXT,
                     open REAL, high REAL, low REAL, close REAL,
                     volume REAL, amount REAL, pct_chg REAL,
+                    adj_factor REAL,     -- 复权因子（tushare 可得，akshare 暂为 NULL）；为 raw+factor 复权重构预留
                     PRIMARY KEY (code, trade_date)
                 )
             """))
+            # Migration: 为旧库补 adj_factor 列（复权因子，P1 raw+factor 重构预留）
+            try:
+                conn.execute(text("ALTER TABLE daily_bars ADD COLUMN adj_factor REAL"))
+            except Exception:
+                pass  # Column already exists
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS financial_data (
                     code TEXT,
                     report_date TEXT,
+                    ann_date TEXT,                       -- 披露日（PIT：决策日只能用 ann_date<=决策日 的财报）；akshare 无则 NULL
                     pe_ttm REAL, pb REAL, roe REAL,
                     revenue_yoy REAL, profit_yoy REAL, total_mv REAL,
                     PRIMARY KEY (code, report_date)
                 )
             """))
+            # Migration: 为旧库补 ann_date 列（财务 point-in-time，堵前视偏差）
+            try:
+                conn.execute(text("ALTER TABLE financial_data ADD COLUMN ann_date TEXT"))
+            except Exception:
+                pass  # Column already exists
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS news (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,9 +180,15 @@ class Storage:
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     cash REAL NOT NULL,
                     initial_cash REAL NOT NULL,
+                    peak_value REAL,                       -- 历史最高组合净值（high-water mark），用于回撤计算
                     updated_at TEXT
                 )
             """))
+            # Migration: 为旧库补 peak_value 列（回撤 high-water mark 持久化）
+            try:
+                conn.execute(text("ALTER TABLE account ADD COLUMN peak_value REAL"))
+            except Exception:
+                pass  # Column already exists
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS update_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,6 +279,53 @@ class Storage:
                     UNIQUE(code)
                 )
             """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS market_sentiment (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_date TEXT NOT NULL UNIQUE,   -- 末日 trade_date 的 ISO 日期，按交易日去重
+                    snapshot_time TEXT NOT NULL,          -- 运行时刻 ISO 时间戳（信息性）
+                    temperature REAL NOT NULL,
+                    label TEXT NOT NULL,                  -- bullish/neutral/bearish
+                    index_moves_json TEXT,
+                    sector_summary_json TEXT,
+                    summary TEXT,                         -- LLM 定性总结
+                    key_events_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS macro_snapshot (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_date TEXT NOT NULL UNIQUE,   -- 各指标最新 as_of 的 ISO 日期，按日去重
+                    snapshot_time TEXT NOT NULL,          -- 运行时刻 ISO 时间戳（信息性）
+                    score REAL NOT NULL,                  -- 0-100 宏观态势分（纯函数算出）
+                    label TEXT NOT NULL,                  -- bullish/neutral/bearish
+                    stance REAL,                          -- [-1,1] 原始态势
+                    components_json TEXT,                 -- 四支柱 {signal, weight}
+                    indicators_json TEXT,                 -- 各指标 {signal, value}
+                    summary TEXT,                         -- LLM 综合定性
+                    key_risks_json TEXT,                  -- LLM 关键风险列表
+                    created_at TEXT NOT NULL
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS execution_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,             -- 运行时刻（= report.timestamp）
+                    mode TEXT,                            -- signal / auto
+                    drawdown_pct REAL,
+                    deescalation_tier INTEGER,
+                    paused_reason TEXT,
+                    n_candidates INTEGER,
+                    n_buy_suggestions INTEGER,
+                    n_sell_suggestions INTEGER,
+                    n_executed INTEGER,
+                    n_blocked INTEGER,
+                    n_errors INTEGER,
+                    strategy_keys_json TEXT,              -- 输入策略键
+                    report_json TEXT NOT NULL             -- 完整 ExecutionReport JSON（可审计回放）
+                )
+            """))
             conn.commit()
             self._init_default_routes(conn)
 
@@ -245,11 +339,15 @@ class Storage:
 
     # ── daily_bars ───────────────────────────────────────────────
     def upsert_daily_bars(self, df: pd.DataFrame):
+        """upsert 日K线：主键冲突时**更新**（刷新陈旧复权价），不再 IGNORE。
+
+        见 ``_make_upsert_method`` 说明——这是修复 qfq 复权漂移的关键。
+        """
         if df.empty:
             return
         df["trade_date"] = df["trade_date"].astype(str)
         df.to_sql("daily_bars", self.engine, if_exists="append", index=False,
-                  method=_insert_or_ignore)
+                  method=_make_upsert_method(["code", "trade_date"]))
 
     def get_daily_bars(self, code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         sql = "SELECT * FROM daily_bars WHERE code = :code"
@@ -273,11 +371,17 @@ class Storage:
 
     # ── financial_data ───────────────────────────────────────────
     def upsert_financial_data(self, df: pd.DataFrame):
+        """upsert 财务数据：主键冲突时**更新**（刷新 ann_date 等字段），不再 IGNORE。
+
+        用 update-existing 而非 IGNORE：ann_date（披露日）可能在重拉时被补全/修正，
+        IGNORE 会保留旧 NULL → 财务 point-in-time 过滤失效。pe_ttm/pb/total_mv 仍由
+        fetcher 只填在最新 report_date 行（历史行 None），update-existing 不破坏该语义。
+        """
         if df.empty:
             return
         df["report_date"] = df["report_date"].astype(str)
         df.to_sql("financial_data", self.engine, if_exists="append", index=False,
-                  method=_insert_or_ignore)
+                  method=_make_upsert_method(["code", "report_date"]))
 
     def get_financial_data(self, code: str) -> pd.DataFrame:
         return pd.read_sql(
@@ -341,6 +445,181 @@ class Storage:
             self.engine, params={"limit": limit}
         )
 
+    # ── market_sentiment（市场情绪温度历史）──────────────────────
+    def save_market_sentiment(self, snapshot: dict) -> None:
+        """按 snapshot_date upsert（同交易日多次运行，后写覆盖前写）。
+
+        JSON 列用 json.dumps(ensure_ascii=False) 序列化；snapshot_date 若是
+        date/datetime 先 isoformat()。镜像 upsert_position 的写法（不改调用方 dict）。
+        """
+        rec = dict(snapshot)
+        sd = rec.get("snapshot_date")
+        if isinstance(sd, (date, datetime)):
+            rec["snapshot_date"] = sd.isoformat()
+        rec["snapshot_time"] = rec.get("snapshot_time") or datetime.now().isoformat()
+        rec["created_at"] = rec.get("created_at") or datetime.now().isoformat()
+        for k in ("index_moves_json", "sector_summary_json", "key_events_json"):
+            v = rec.get(k)
+            if v is not None and not isinstance(v, str):
+                rec[k] = json.dumps(v, ensure_ascii=False)
+        with self.engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO market_sentiment
+                    (snapshot_date, snapshot_time, temperature, label,
+                     index_moves_json, sector_summary_json, summary, key_events_json, created_at)
+                VALUES
+                    (:snapshot_date, :snapshot_time, :temperature, :label,
+                     :index_moves_json, :sector_summary_json, :summary, :key_events_json, :created_at)
+                ON CONFLICT(snapshot_date) DO UPDATE SET
+                    snapshot_time       = excluded.snapshot_time,
+                    temperature         = excluded.temperature,
+                    label               = excluded.label,
+                    index_moves_json    = excluded.index_moves_json,
+                    sector_summary_json = excluded.sector_summary_json,
+                    summary             = excluded.summary,
+                    key_events_json     = excluded.key_events_json,
+                    created_at          = excluded.created_at
+            """), rec)
+            conn.commit()
+
+    def get_market_sentiment_history(self, limit: int = 30) -> list:
+        """返回最近 N 条情绪快照（新在前），JSON 列已反序列化为对象。"""
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT * FROM market_sentiment ORDER BY snapshot_date DESC LIMIT :limit"
+            ), {"limit": limit}).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r._mapping)
+            for k in ("index_moves_json", "sector_summary_json", "key_events_json"):
+                raw = d.get(k)
+                if isinstance(raw, str) and raw:
+                    try:
+                        d[k] = json.loads(raw)
+                    except (ValueError, TypeError):
+                        pass
+            result.append(d)
+        return result
+
+
+    # ── macro_snapshot（宏观态势历史）────────────────────────────
+    def save_macro_snapshot(self, snapshot: dict) -> None:
+        """按 snapshot_date upsert（同日多次运行，后写覆盖前写）。
+
+        JSON 列用 json.dumps(ensure_ascii=False) 序列化；snapshot_date 若是
+        date/datetime 先 isoformat()。镜像 save_market_sentiment 的写法（不改调用方 dict）。
+        """
+        rec = dict(snapshot)
+        sd = rec.get("snapshot_date")
+        if isinstance(sd, (date, datetime)):
+            rec["snapshot_date"] = sd.isoformat()
+        rec["snapshot_time"] = rec.get("snapshot_time") or datetime.now().isoformat()
+        rec["created_at"] = rec.get("created_at") or datetime.now().isoformat()
+        for k in ("components_json", "indicators_json", "key_risks_json"):
+            v = rec.get(k)
+            if v is not None and not isinstance(v, str):
+                rec[k] = json.dumps(v, ensure_ascii=False)
+        with self.engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO macro_snapshot
+                    (snapshot_date, snapshot_time, score, label, stance,
+                     components_json, indicators_json, summary, key_risks_json, created_at)
+                VALUES
+                    (:snapshot_date, :snapshot_time, :score, :label, :stance,
+                     :components_json, :indicators_json, :summary, :key_risks_json, :created_at)
+                ON CONFLICT(snapshot_date) DO UPDATE SET
+                    snapshot_time     = excluded.snapshot_time,
+                    score             = excluded.score,
+                    label             = excluded.label,
+                    stance            = excluded.stance,
+                    components_json   = excluded.components_json,
+                    indicators_json   = excluded.indicators_json,
+                    summary           = excluded.summary,
+                    key_risks_json    = excluded.key_risks_json,
+                    created_at        = excluded.created_at
+            """), rec)
+            conn.commit()
+
+    def get_macro_history(self, limit: int = 60) -> list:
+        """返回最近 N 条宏观态势快照（新在前），JSON 列已反序列化为对象。"""
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT * FROM macro_snapshot ORDER BY snapshot_date DESC LIMIT :limit"
+            ), {"limit": limit}).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r._mapping)
+            for k in ("components_json", "indicators_json", "key_risks_json"):
+                raw = d.get(k)
+                if isinstance(raw, str) and raw:
+                    try:
+                        d[k] = json.loads(raw)
+                    except (ValueError, TypeError):
+                        pass
+            result.append(d)
+        return result
+
+
+    # ── execution_reports（信号生成器运行报告，可审计）──────────────
+    def save_execution_report(self, report: dict) -> int:
+        """落库一份 ExecutionReport（可审计回放）。
+
+        ``report`` 是 ``ExecutionReport`` 的 dict 形态（含 timestamp/mode/各 list 字段）。
+        list/dict 字段整体序列化为 ``report_json``；同时抽取关键计数为独立列，便于
+        不解析 JSON 也能快速筛选/统计。返回自增 id。
+        """
+        rec = {
+            "created_at": report.get("timestamp") or datetime.now().isoformat(),
+            "mode": report.get("mode"),
+            "drawdown_pct": report.get("drawdown_pct"),
+            "deescalation_tier": report.get("deescalation_tier"),
+            "paused_reason": report.get("paused_reason") or "",
+            "n_candidates": len(report.get("strategy_candidates", [])),
+            "n_buy_suggestions": len(report.get("buy_suggestions", [])),
+            "n_sell_suggestions": len(report.get("sell_suggestions", [])),
+            "n_executed": len(report.get("executed_orders", []))
+                          + len(report.get("stop_loss_sells", []))
+                          + len(report.get("take_profit_sells", []))
+                          + len(report.get("deescalation_sells", [])),
+            "n_blocked": len(report.get("risk_blocked", [])),
+            "n_errors": len(report.get("errors", [])),
+            "strategy_keys_json": json.dumps(report.get("strategy_keys", []),
+                                              ensure_ascii=False) if isinstance(report.get("strategy_keys"), list)
+                                  else (report.get("strategy_keys") or ""),
+            "report_json": json.dumps(report, ensure_ascii=False, default=str),
+        }
+        with self.engine.connect() as conn:
+            result = conn.execute(text("""
+                INSERT INTO execution_reports
+                    (created_at, mode, drawdown_pct, deescalation_tier, paused_reason,
+                     n_candidates, n_buy_suggestions, n_sell_suggestions, n_executed,
+                     n_blocked, n_errors, strategy_keys_json, report_json)
+                VALUES
+                    (:created_at, :mode, :drawdown_pct, :deescalation_tier, :paused_reason,
+                     :n_candidates, :n_buy_suggestions, :n_sell_suggestions, :n_executed,
+                     :n_blocked, :n_errors, :strategy_keys_json, :report_json)
+            """), rec)
+            conn.commit()
+            return result.lastrowid
+
+    def get_execution_reports(self, limit: int = 20) -> list:
+        """返回最近 N 条运行报告（新在前），``report_json`` 已反序列化回 dict。"""
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT * FROM execution_reports ORDER BY id DESC LIMIT :limit"
+            ), {"limit": limit}).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r._mapping)
+            raw = d.get("report_json")
+            if isinstance(raw, str) and raw:
+                try:
+                    d["report"] = json.loads(raw)
+                except (ValueError, TypeError):
+                    d["report"] = None
+            out.append(d)
+        return out
+
     # ── backtest_results ─────────────────────────────────────────
     def save_backtest_result(self, result: dict):
         result["created_at"] = datetime.now().isoformat()
@@ -394,21 +673,36 @@ class Storage:
         """读取账户资金。首次启动（无记录）返回空 dict。"""
         with self.engine.connect() as conn:
             row = conn.execute(
-                text("SELECT cash, initial_cash FROM account WHERE id = 1")
+                text("SELECT cash, initial_cash, peak_value FROM account WHERE id = 1")
             ).fetchone()
         return dict(row._mapping) if row else {}
 
     def upsert_account(self, cash: float, initial_cash: float):
+        """upsert 账户资金。首次插入时 peak_value=initial_cash（回撤起点峰值）；
+        已存在记录时**不覆盖 peak_value**（保护历史 high-water mark）。"""
         now = datetime.now().isoformat()
         with self.engine.connect() as conn:
             conn.execute(text("""
-                INSERT INTO account (id, cash, initial_cash, updated_at)
-                VALUES (1, :cash, :initial_cash, :now)
+                INSERT INTO account (id, cash, initial_cash, peak_value, updated_at)
+                VALUES (1, :cash, :initial_cash, :initial_cash, :now)
                 ON CONFLICT(id) DO UPDATE SET
                     cash          = excluded.cash,
                     initial_cash  = excluded.initial_cash,
                     updated_at    = excluded.updated_at
             """), {"cash": cash, "initial_cash": initial_cash, "now": now})
+            conn.commit()
+
+    def update_peak_value(self, peak_value: float):
+        """更新历史最高组合净值（high-water mark）。
+
+        仅在 account 行已存在时生效（Portfolio 初始化必然先 upsert_account）。
+        缺失行时静默 no-op，避免构造 cash=0 的脏行。
+        """
+        now = datetime.now().isoformat()
+        with self.engine.connect() as conn:
+            conn.execute(text(
+                "UPDATE account SET peak_value = :peak, updated_at = :now WHERE id = 1"
+            ), {"peak": peak_value, "now": now})
             conn.commit()
 
     def get_positions(self) -> pd.DataFrame:

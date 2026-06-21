@@ -173,14 +173,18 @@ def _render_order_history(simulator):
 
 
 def _render_auto_trading(dm, simulator):
-    """自动交易模式：策略信号 + AI分析 + 风控 → 自动下单。"""
+    """信号生成器模式（方案 B）：策略筛选 + 风控预算 → 交易**建议**，不自动下单。"""
     from src.trading.auto_trader import AutoTrader, RiskParams
     from src.analysis.advisor import Advisor
     from src.config import get_config
     from src.strategy.screener import STRATEGY_REGISTRY
 
-    st.subheader("自动交易模式")
-    st.info("自动交易流程：策略筛选 → AI分析验证 → 风控过滤 → 自动下单。点击「开始自动交易」执行一轮扫描。")
+    st.subheader("信号生成器（方案 B）")
+    st.warning(
+        "⚠️ **信号生成模式**：本模块跑完「止盈止损扫描 + 策略筛选 + 风控预算」后产出"
+        "**交易建议**，**不会自动下单**。请审阅后手动执行。AI 分析仅作参考注释，"
+        "不再作为买卖决策门。"
+    )
 
     cfg = get_config()
 
@@ -206,25 +210,26 @@ def _render_auto_trading(dm, simulator):
 
     # ── 策略选择 ──
     st.markdown("**策略选择**")
+    # 排除 is_deprecated 的失效策略（kdj/boll，A股机构化后失效，见审计报告 P1-D）
     strategy_options = {k: v.description if hasattr(v, "description") else k
                         for k, v in STRATEGY_REGISTRY.items()
-                        if hasattr(v(), "supports_evaluate") and v().supports_evaluate()}
+                        if not getattr(v, "is_deprecated", False)
+                        and hasattr(v(), "supports_evaluate") and v().supports_evaluate()}
     selected_strategies = st.multiselect(
         "选择策略（至少1个）",
         list(strategy_options.keys()),
-        default=["ma_cross", "macd_golden"],
+        default=["ma_cross", "macd_golden", "small_cap"],
         format_func=lambda x: strategy_options.get(x, x),
         key="at_strategies"
     )
 
-    # ── 风控参数 ──
-    with st.expander("⚙️ 风控参数配置", expanded=False):
+    # ── 风控参数（仅用于建议的预算计算，非自动下单）──
+    with st.expander("⚙️ 风控参数配置（用于建议的仓位预算）", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             max_pos_pct = st.slider("单股最大仓位 (%)", 5, 50, 20, key="at_max_pos")
             max_total_pct = st.slider("总仓位上限 (%)", 20, 100, 80, key="at_max_total")
             max_daily = st.slider("单日最大交易次数", 1, 20, 5, key="at_max_daily")
-            min_confidence = st.slider("AI最低置信度", 30, 90, 60, key="at_min_conf")
         with col2:
             stop_loss = st.slider("止损线 (%)", 3, 20, 8, key="at_stop_loss")
             take_profit = st.slider("止盈线 (%)", 5, 50, 20, key="at_take_profit")
@@ -237,7 +242,6 @@ def _render_auto_trading(dm, simulator):
         stop_loss_pct=float(stop_loss),
         take_profit_pct=float(take_profit),
         max_drawdown_pct=float(max_drawdown),
-        min_ai_confidence=float(min_confidence),
     )
 
     # ── 执行按钮 ──
@@ -245,8 +249,9 @@ def _render_auto_trading(dm, simulator):
     if not can_run:
         st.warning("请配置股票池和至少一个策略")
 
-    if st.button("🚀 开始自动交易", type="primary", disabled=not can_run):
+    if st.button("🚀 生成交易信号", type="primary", disabled=not can_run):
         advisor = Advisor(cfg, dm)
+        # auto_execute=False（默认）= 信号生成器，不下单
         auto_trader = AutoTrader(dm, simulator, advisor, risk)
 
         progress_placeholder = st.empty()
@@ -256,57 +261,70 @@ def _render_auto_trading(dm, simulator):
             log_lines.append(f"**{phase}**：{detail}" if detail else f"**{phase}**")
             progress_placeholder.markdown("\n\n".join(log_lines[-6:]))
 
-        with st.spinner("自动交易执行中..."):
+        with st.spinner("生成交易信号中..."):
             try:
                 report = auto_trader.run(stock_pool, selected_strategies, on_status)
                 st.session_state["auto_trade_report"] = report
-                st.success(f"执行完毕：共 {report.total_executed} 笔成交")
+                st.success(
+                    f"生成完毕：{len(report.buy_suggestions)} 条买入建议、"
+                    f"{len(report.sell_suggestions)} 条卖出建议（未自动下单）"
+                )
             except Exception as e:
-                st.error(f"自动交易失败：{e}")
+                st.error(f"信号生成失败：{e}")
 
-    # ── 执行报告 ──
+    # ── 建议报告 ──
     report = st.session_state.get("auto_trade_report")
     if report:
         st.markdown("---")
-        st.markdown("#### 执行报告")
-        st.caption(f"执行时间：{report.timestamp[:19]}")
+        st.markdown("#### 交易建议报告")
+        st.caption(f"生成时间：{report.timestamp[:19]} · 模式：{report.mode}")
 
         if report.paused_reason:
             st.warning(f"⚠️ {report.paused_reason}")
+        elif report.drawdown_pct is not None:
+            st.caption(f"当前回撤 {report.drawdown_pct:.1f}%（high-water mark 口径）")
 
         # 汇总指标
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("策略候选", len(report.strategy_candidates))
-        c2.metric("AI通过", len(report.ai_recommendations))
-        c3.metric("风控拦截", len(report.risk_blocked))
-        c4.metric("实际成交", len(report.executed_orders))
+        c2.metric("AI注释", len(report.ai_recommendations))
+        c3.metric("买入建议", len(report.buy_suggestions))
+        c4.metric("卖出建议", len(report.sell_suggestions))
+        c5.metric("风控拦截", len(report.risk_blocked))
 
-        # 止盈止损
-        if report.stop_loss_sells or report.take_profit_sells:
-            st.markdown("**止盈止损执行：**")
-            for item in report.stop_loss_sells:
-                res = item["result"]
-                icon = "✅" if res.get("success") else "❌"
-                st.write(f"{icon} 止损卖出 {item['name']}（{item['code']}）— {item['reason']}")
-            for item in report.take_profit_sells:
-                res = item["result"]
-                icon = "✅" if res.get("success") else "❌"
-                st.write(f"{icon} 止盈卖出 {item['name']}（{item['code']}）— {item['reason']}")
+        # 卖出建议（止盈止损）
+        if report.sell_suggestions:
+            st.markdown("**卖出建议（止盈/止损）：**")
+            for item in report.sell_suggestions:
+                note = f" — {item['note']}" if item.get("note") else ""
+                st.write(f"🔻 {item['name']}（{item['code']}）— {item['reason']}{note}")
 
-        # 买入成交明细
-        if report.executed_orders:
-            st.markdown("**买入成交明细：**")
+        # 买入建议明细
+        if report.buy_suggestions:
+            st.markdown("**买入建议明细：**")
             rows = []
-            for o in report.executed_orders:
-                res = o["result"]
+            for o in report.buy_suggestions:
                 rows.append({
                     "代码": o["code"], "名称": o["name"],
-                    "数量": o["quantity"], "价格": o["price"],
+                    "建议数量": o["quantity"], "现价": o["price"],
+                    "建议金额": o.get("amount", round(o["quantity"] * o["price"], 2)),
                     "策略": "/".join(o.get("strategies", [])),
-                    "AI置信度": f"{o.get('confidence', 0):.0f}%",
-                    "状态": "✅ 成功" if res.get("success") else f"❌ {res.get('msg', '')}",
+                    "综合得分": o.get("score", 0),
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("以上为风控预算后的建议，**不会自动下单**，请自行决策。")
+
+        # AI 注释（参考用）
+        if report.ai_recommendations:
+            with st.expander(f"AI 分析注释（{len(report.ai_recommendations)} 只，仅供参考，非决策门）"):
+                for a in report.ai_recommendations:
+                    conf = a.get("confidence", 0)
+                    sug = a.get("suggestion", "")
+                    analysis = (a.get("ai_analysis", {}) or {}).get("analysis", "")
+                    st.write(
+                        f"- {a['name']}（{a['code']}）：AI置信度 {conf:.0f}，建议「{sug}」"
+                        + (f"— {analysis[:80]}..." if analysis else "")
+                    )
 
         # 风控拦截
         if report.risk_blocked:

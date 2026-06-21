@@ -13,10 +13,10 @@ class TestBuy:
         result = portfolio.buy("000001", "平安银行", 10.00, 100, "2024-01-01")
         assert result["success"] is True
         order = result["order"]
-        # 100×10=1000，佣金 max(0.3,5)=5 → 总成本 1005
+        # 100×10=1000；佣金 max(0.3,5)=5 + 过户费 1000*0.0001=0.1 = 5.1 → 总成本 1005.1
         assert order["amount"] == 1000.0
-        assert order["commission"] == 5.0
-        assert portfolio.cash == pytest.approx(1_000_000.0 - 1005.0)
+        assert order["commission"] == 5.1
+        assert portfolio.cash == pytest.approx(1_000_000.0 - 1005.1)
 
         pos = portfolio.get_position("000001")
         assert pos["quantity"] == 100
@@ -91,8 +91,8 @@ class TestValuation:
         cash_before_sell = portfolio.cash
         portfolio.end_of_day("2024-01-02")
         portfolio.sell("000001", 12.00, 100, "2024-01-02")
-        # 卖出 100×12=1200，佣金 max(0.36,5)=5 + 印花 1.2 = 6.2 → 净到账 1193.8
-        assert portfolio.cash == pytest.approx(cash_before_sell + 1193.8)
+        # 卖出 100×12=1200；佣金 max(0.36,5)=5 + 过户 0.12 + 印花 1200*0.0005=0.6 = 5.72 → 净到账 1194.28
+        assert portfolio.cash == pytest.approx(cash_before_sell + 1194.28)
 
     @pytest.mark.integration
     def test_update_prices_recomputes_pnl(self, portfolio):
@@ -110,5 +110,5 @@ class TestValuation:
         s = portfolio.summary({"000001": 12.00})
         assert s["position_count"] == 1
         assert s["market_value"] == 1200.0
-        # 总资产 = 现金(1,000,000-1005) + 市值 1200
-        assert s["total_value"] == pytest.approx(1_000_000.0 - 1005.0 + 1200.0)
+        # 总资产 = 现金(1,000,000-1005.1) + 市值 1200
+        assert s["total_value"] == pytest.approx(1_000_000.0 - 1005.1 + 1200.0)

@@ -20,6 +20,8 @@ class BaseFetcher(ABC):
         """
         获取日K线数据。
         返回列: code, trade_date(date), open, high, low, close, volume, amount, pct_chg
+        可选列: adj_factor（复权因子；tushare 可得，akshare 暂无，为 P1 raw+factor
+        复权重构预留）。缺失该列时存储层按 NULL 处理，不影响当前 qfq 读取。
         """
 
     @abstractmethod

@@ -40,19 +40,37 @@ class TushareFetcher(BaseFetcher):
             self._pro = ts.pro_api(self._token)
         return self._pro
 
-    def get_stock_list(self) -> pd.DataFrame:
-        """获取A股全量股票列表，返回列: code, name, market"""
-        df = self.pro.stock_basic(
-            exchange="",
-            list_status="L",
-            fields="ts_code,name,market,list_date"
-        )
-        if df is None or df.empty:
+    def get_stock_list(self, include_delisted: bool = False) -> pd.DataFrame:
+        """获取A股股票列表，返回列: code, name, market。
+
+        :param include_delisted: 默认仅 ``list_status="L"``（在市）——这是**幸存者偏差**
+            来源：回测池无退市股，价值/低估值策略收益系统性高估（审计报告 P1-2）。
+            传 True 则同时取 ``D``（退市）+ ``P``（暂停上市），消除幸存者偏差。
+            注意：退市股需 tushare 积分足够，且拉取后需补其历史 K 线（一次性，耗积分）。
+        """
+        statuses = ("L", "D", "P") if include_delisted else ("L",)
+        frames = []
+        for status in statuses:
+            try:
+                df = self.pro.stock_basic(
+                    exchange="",
+                    list_status=status,
+                    fields="ts_code,name,market,list_date"
+                )
+            except Exception as e:
+                logger.warning(f"Tushare stock_basic list_status={status} 失败: {e}")
+                continue
+            if df is not None and not df.empty:
+                df["list_status"] = status
+                frames.append(df)
+        if not frames:
             return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
         # ts_code 格式: 000001.SZ → 转为纯数字代码
         df["code"] = df["ts_code"].apply(lambda x: x.split(".")[0])
         df["market"] = df["ts_code"].apply(lambda x: x.split(".")[1])
-        return df[["code", "name", "market"]].reset_index(drop=True)
+        cols = ["code", "name", "market", "list_status"] if "list_status" in df.columns else ["code", "name", "market"]
+        return df[cols].reset_index(drop=True)
 
     def get_daily_bars(self, code: str, start_date: str, end_date: str,
                        adjust: str = "qfq") -> pd.DataFrame:
@@ -100,19 +118,43 @@ class TushareFetcher(BaseFetcher):
         # Tushare vol 单位是手，转为股（与 akshare/tencent 一致，避免跨源100倍差异）
         if "volume" in df.columns:
             df["volume"] = df["volume"] * 100
-        cols = ["code", "trade_date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]
+
+        # 复权因子（best-effort）：为 P1「raw 价 + adj_factor 实时算复权」重构预留。
+        # 积分不足时取不到 → adj_factor 留空，不影响当前 qfq 落库与读取。
+        df["adj_factor"] = None
+        try:
+            adj_df = self.pro.adj_factor(
+                ts_code=ts_code,
+                start_date=_ts_date(start_date),
+                end_date=_ts_date(end_date),
+            )
+            if adj_df is not None and not adj_df.empty:
+                adj_df["trade_date"] = adj_df["trade_date"].apply(
+                    lambda x: _from_ts_date(x) if pd.notna(x) else None
+                )
+                df = df.merge(adj_df[["trade_date", "adj_factor"]], on="trade_date",
+                              how="left", suffixes=("", "_adj"))
+                if "adj_factor_adj" in df.columns:
+                    df["adj_factor"] = df["adj_factor_adj"].combine_first(df["adj_factor"])
+                    df = df.drop(columns=["adj_factor_adj"])
+        except Exception as e:
+            logger.warning(f"Tushare adj_factor {code} 取数失败（忽略，复权因子留空）: {e}")
+
+        cols = ["code", "trade_date", "open", "high", "low", "close",
+                "volume", "amount", "pct_chg", "adj_factor"]
         return df[[c for c in cols if c in df.columns]].sort_values("trade_date").reset_index(drop=True)
 
     def get_financial_indicators(self, code: str) -> pd.DataFrame:
         """
         获取个股基本面指标。
-        返回列: code, report_date, pe_ttm, pb, roe
+        返回列: code, report_date, ann_date, pe_ttm, pb, roe, ...
+        ann_date（披露日）用于财务 point-in-time 过滤（堵回测前视偏差）。
         """
         ts_code = self._to_ts_code(code)
         try:
             df = self.pro.fina_indicator(
                 ts_code=ts_code,
-                fields="ts_code,end_date,roe,netprofit_yoy,or_yoy"
+                fields="ts_code,end_date,ann_date,roe,netprofit_yoy,or_yoy"
             )
         except Exception as e:
             logger.warning(f"Tushare fina_indicator {code} 失败: {e}")
@@ -139,6 +181,13 @@ class TushareFetcher(BaseFetcher):
         df["report_date"] = df["report_date"].apply(
             lambda x: _from_ts_date(x) if pd.notna(x) else None
         )
+        # ann_date 统一转 ISO 日期（PIT 过滤按 ann_date<=决策日 判定已披露）
+        if "ann_date" in df.columns:
+            df["ann_date"] = df["ann_date"].apply(
+                lambda x: _from_ts_date(x) if pd.notna(x) else None
+            )
+        else:
+            df["ann_date"] = None
 
         # pe_ttm/pb/total_mv 是当前交易日的时点估值，不属于历史报告期；
         # 只填到最新一条报告期行，避免广播成水平线（旧实现把最新估值抹平到所有季度，
@@ -153,7 +202,7 @@ class TushareFetcher(BaseFetcher):
             df.at[latest_idx, "pb"] = basic.get("pb")
             df.at[latest_idx, "total_mv"] = basic.get("total_mv")
 
-        cols = ["code", "report_date", "pe_ttm", "pb", "roe",
+        cols = ["code", "report_date", "ann_date", "pe_ttm", "pb", "roe",
                 "revenue_yoy", "profit_yoy", "total_mv"]
         return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
 

@@ -6,6 +6,13 @@ import pandas as pd
 import backtrader as bt
 
 from src.strategy.base import BaseStrategy
+from src.trading.rules import (
+    STAMP_DUTY_RATE,
+    TRANSFER_FEE_RATE,
+    is_at_limit_up,
+    is_at_limit_down,
+)
+from src.trading.risk import cap_size_by_volume
 
 logger = logging.getLogger(__name__)
 
@@ -23,16 +30,20 @@ class PandasData(bt.feeds.PandasData):
     )
 
 
-# ── A股手续费模型（佣金双边 + 卖出印花税） ──────────────────────
+# ── A股手续费模型（佣金+过户费双边 + 卖出印花税） ───────────────
 class AShareCommissionInfo(bt.CommInfoBase):
-    """A股手续费：买卖各收佣金，卖出额外收印花税。
+    """A股手续费：买卖各收佣金 + 双边过户费，卖出额外收印花税。
     backtrader 内置 setcommission 只支持对称费率，无法表达"仅卖出收印花税"，
-    故自定义 CommissionInfo。percabs=True 表示 commission/stamp_duty 均为比例小数。
+    故自定义 CommissionInfo。percabs=True 表示各项费率均为比例小数。
+
+    与实盘 ``trading.rules.calc_commission`` 口径一致（2023.8 印花税 0.05% /
+    2022.4 过户费 0.001% 双边），避免「实盘严谨、回测放水」的两套口径。
     """
 
     params = (
         ("commission", 0.0003),
-        ("stamp_duty", 0.001),
+        ("stamp_duty", 0.0005),   # 印花税：卖出单边（2023.8.28 起 0.05%）
+        ("transfer_fee", 0.0001), # 过户费：双边（2022.4.29 起沪深统一 0.001%）
         ("mult", 1.0),
         ("commtype", bt.CommInfoBase.COMM_PERC),
         ("stocklike", True),
@@ -41,7 +52,7 @@ class AShareCommissionInfo(bt.CommInfoBase):
 
     def _getcommission(self, size, price, pseudoexec=False):
         cost = abs(size) * price
-        fee = cost * self.p.commission
+        fee = cost * self.p.commission + cost * self.p.transfer_fee  # 佣金 + 过户费（双边）
         if size < 0:  # 仅卖出收印花税
             fee += cost * self.p.stamp_duty
         return fee
@@ -49,42 +60,68 @@ class AShareCommissionInfo(bt.CommInfoBase):
 
 # ── 通用Backtrader策略包装器 ──────────────────────────────────────
 class BTStrategyWrapper(bt.Strategy):
-    """将我们的选股信号转换为Backtrader买卖逻辑的通用包装"""
+    """将选股信号转换为Backtrader买卖逻辑的通用包装。
+
+    实盘约束（与 ``trading.rules`` / ``trading.auto_trader`` 一致，避免回测放水）：
+    - **涨跌停/一字板**：涨停买不进、跌停卖不掉（``is_at_limit_up/down``）；
+    - **成交量上限**：单笔不超过当日成交量 25%（``cap_size_by_volume``），防无限流动性幻觉；
+    - **T+1**：买入当 bar 不可卖（记录 ``_buy_bar``）；
+    - **成交价**：backtrader 默认在**下一根 bar 开盘价**成交（非当日收盘价闭环）。
+    """
 
     params = (
         ("signal_codes", []),   # 选股结果中的股票代码列表
         ("stop_loss", 0.05),    # 止损比例
         ("take_profit", 0.15),  # 止盈比例
         ("position_pct", 0.1),  # 每只股票仓位占总资金比例
+        ("vol_cap_pct", 0.25),  # 单笔占当日成交量上限
     )
 
     def __init__(self):
         self.orders = {}
         self.buy_prices = {}
         self.traded_once = set()  # 已建过仓的代码，卖出后不回补，避免无限循环放大交易次数
+        self._buy_bar = {}        # code -> 买入决策 bar 序号（T+1 判定）
 
     def next(self):
         for i, data in enumerate(self.datas):
             code = data._name
             pos = self.getposition(data)
+            bar_idx = len(data)  # 当前 bar 在该 data 序列中的序号
+            # prev_close：前一日收盘（涨跌停基准）；首 bar 无前值，用当日收盘兜底
+            prev_close = data.close[-1] if bar_idx > 1 else data.close[0]
+            current = data.close[0]
 
             if pos.size > 0:
-                # 持仓中：检查止损止盈
-                cost = self.buy_prices.get(code, data.close[0])
-                pct = (data.close[0] - cost) / cost
+                # 持仓中：止损止盈
+                # T+1：买入决策当 bar 不可卖；跌停日卖不出（realistic pessimism）
+                bought_bar = self._buy_bar.get(code)
+                t1_locked = bought_bar is not None and bar_idx <= bought_bar
+                if t1_locked or is_at_limit_down(code, prev_close, current):
+                    continue
+                cost = self.buy_prices.get(code, current)
+                pct = (current - cost) / cost
                 if pct <= -self.p.stop_loss or pct >= self.p.take_profit:
                     self.sell(data=data, size=pos.size)
             else:
                 # 未持仓：在信号列表中且首次触及才买入
                 # （卖出后 traded_once 命中，不再回补，避免止损后反复买卖放大交易次数）
-                if code in self.p.signal_codes and code not in self.traded_once:
-                    cash = self.broker.getcash()
-                    target_value = self.broker.getvalue() * self.p.position_pct
-                    size = int(target_value / data.close[0] / 100) * 100  # 整手
-                    if size > 0 and cash >= size * data.close[0]:
-                        self.buy(data=data, size=size)
-                        self.buy_prices[code] = data.close[0]
-                        self.traded_once.add(code)
+                if code not in self.p.signal_codes or code in self.traded_once:
+                    continue
+                # 涨停/一字板买不进
+                if is_at_limit_up(code, prev_close, current):
+                    continue
+                cash = self.broker.getcash()
+                target_value = self.broker.getvalue() * self.p.position_pct
+                raw_size = int(target_value / current / 100) * 100  # 整手
+                # 成交量上限：防无限流动性（小盘股大单打飞价格）
+                size = cap_size_by_volume(raw_size, data.volume[0],
+                                          max_pct=self.p.vol_cap_pct)
+                if size > 0 and cash >= size * current:
+                    self.buy(data=data, size=size)
+                    self.buy_prices[code] = current
+                    self._buy_bar[code] = bar_idx
+                    self.traded_once.add(code)
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -92,12 +129,36 @@ class BTStrategyWrapper(bt.Strategy):
             logger.debug(f"{order.data._name} {action} {order.executed.size}股 @{order.executed.price:.2f}")
 
 
+# ── 净值曲线分析器 ─────────────────────────────────────────────────
+class EquityCurveAnalyzer(bt.Analyzer):
+    """逐 bar 记录组合净值 (date, broker.getvalue())，用于绘制净值曲线。
+
+    比 TimeReturn 重建更精确：直接读取每根 bar 的真实组合总价值，无复利累积误差。
+    """
+
+    def start(self):
+        self.dates = []
+        self.values = []
+
+    def next(self):
+        # strategy.datetime 是 backtrader 的自动主时钟，date(0) 为当前 bar 日期。
+        self.dates.append(self.strategy.datetime.date(0))
+        self.values.append(self.strategy.broker.getvalue())
+
+    def get_analysis(self):
+        return {"dates": list(self.dates), "values": list(self.values)}
+
+
 # ── 回测引擎 ─────────────────────────────────────────────────────
 class BacktestEngine:
     def __init__(self, config: dict):
-        self.initial_cash = config["backtest"]["initial_cash"]
-        self.commission = config["backtest"]["commission"]
-        self.stamp_duty = config["backtest"]["stamp_duty"]
+        bt_cfg = config.get("backtest", {}) or {}
+        # 用 .get + 规则常量兜底，兼容旧 config.yaml（缺少 transfer_fee/slippage 时不报错）
+        self.initial_cash = bt_cfg.get("initial_cash", 1_000_000)
+        self.commission = bt_cfg.get("commission", 0.0003)
+        self.stamp_duty = bt_cfg.get("stamp_duty", STAMP_DUTY_RATE)
+        self.transfer_fee = bt_cfg.get("transfer_fee", TRANSFER_FEE_RATE)
+        self.slippage = bt_cfg.get("slippage", 0.001)
 
     def run(
         self,
@@ -118,10 +179,14 @@ class BacktestEngine:
         """
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(self.initial_cash)
-        # A股手续费：佣金双边 + 卖出印花税（setcommission 不支持非对称印花税）
+        # A股手续费：佣金+过户费双边 + 卖出印花税（与 trading.rules 口径一致）
         cerebro.broker.addcommissioninfo(AShareCommissionInfo(
-            commission=self.commission, stamp_duty=self.stamp_duty
+            commission=self.commission, stamp_duty=self.stamp_duty,
+            transfer_fee=self.transfer_fee,
         ))
+        # 滑点：防「无限流动性、零冲击」的回测虚高（默认单边 0.1%）
+        if self.slippage and self.slippage > 0:
+            cerebro.broker.set_slippage_perc(perc=self.slippage)
 
         # 添加数据
         added = 0
@@ -148,16 +213,23 @@ class BacktestEngine:
         )
 
         # 分析器
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", riskfreerate=0.03)
+        # riskfreerate 为**每周期(日)**无风险利率：backtrader 按 bar 减去再年化，
+        # 传 0.03 会被当成 3%/日（年化 1095%，荒谬）。改为年化 3% 折算到日。
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe",
+                            riskfreerate=0.03 / 252, annualize=True, timeframe=bt.TimeFrame.Days)
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
         cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
+        cerebro.addanalyzer(EquityCurveAnalyzer, _name="equity")
 
         results = cerebro.run()
         strat = results[0]
 
         final_value = cerebro.broker.getvalue()
         total_return = (final_value - self.initial_cash) / self.initial_cash * 100
+
+        # 净值曲线
+        equity = strat.analyzers.equity.get_analysis()
 
         # 提取分析结果
         sharpe = strat.analyzers.sharpe.get_analysis().get("sharperatio") or 0
@@ -188,4 +260,8 @@ class BacktestEngine:
             "win_rate": round(win_rate, 1),
             "profit_loss_ratio": round(profit_loss_ratio, 2),
             "trades": total_trades,
+            "equity_curve": {
+                "dates": equity.get("dates", []),
+                "values": equity.get("values", []),
+            },
         }

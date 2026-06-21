@@ -1,8 +1,12 @@
 """AKShare数据获取封装"""
+import os
 import time
+import socket
+import random
 import logging
+import threading
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Any, Callable, Optional
 import pandas as pd
 
 from src.data.base_fetcher import BaseFetcher
@@ -10,24 +14,103 @@ from src.data.base_fetcher import BaseFetcher
 logger = logging.getLogger(__name__)
 
 
-def _retry(func, retries=3, delay=2):
+# ── 国内行情域名直连（绕过系统代理）─────────────────────────────────
+# akshare 打的东方财富/新浪/交易所都是国内站，直连本就可达；但用户的系统代理
+# （如 Clash 默认 7890）常把这些请求也绕进去，导致 ProxyError 全挂（选股池、
+# 基准指数、备份 K 线全部失败）。对这些域名设置 NO_PROXY 让 requests 直连；
+# 无代理环境下是 no-op，安全。
+_DOMESTIC_DIRECT_DOMAINS = (
+    "eastmoney.com",   # 东方财富：个股/指数/财务，akshare 主要源
+    "sinajs.cn",       # 新浪实时行情
+    "sina.com.cn",
+    "sse.com.cn",      # 上交所
+    "szse.cn",         # 深交所
+)
+
+
+def _ensure_domestic_direct() -> None:
+    """把这些国内行情域名加入 NO_PROXY，使其绕过系统代理直连。保留用户已有设置。"""
+    existing = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    parts = [h.strip() for h in existing.split(",") if h.strip()]
+    for d in _DOMESTIC_DIRECT_DOMAINS:
+        if d not in parts:
+            parts.append(d)
+    merged = ",".join(parts)
+    os.environ["NO_PROXY"] = merged
+    os.environ["no_proxy"] = merged  # 兼容大小写读取
+
+
+_ensure_domestic_direct()
+
+# 全局 socket 超时：akshare/requests 调用默认无 timeout，东财反爬升级到「接受连接
+# 不响应」时会无限挂起（_retry/备源都触发不了——首参永不返回）。设 10s 兜底，
+# 让挂起的调用在 10s 内抛 socket.timeout → 走重试/腾讯备源。
+# 仅影响「未显式设 timeout」的 requests 调用（akshare/cninfo）；腾讯(显式 timeout=10)
+# 与 LLM SDK(httpx 自管 timeout)不受影响。
+socket.setdefaulttimeout(10)
+
+
+def _run_timeout(func: Callable[[], Any], timeout: float = 8) -> Any:
+    """在线程里跑 func，超时抛 TimeoutError。
+
+    akshare/urllib3 实测**不受** socket.setdefaulttimeout 约束（东财「接受连接不
+    响应」时无限阻塞），用线程级硬超时兜底，让 ``_retry`` / 腾讯备源得以触发。
+    用 **daemon 线程**——超时后 hung 线程残留但不阻塞解释器退出（ThreadPoolExecutor
+    的非 daemon worker 会卡住 shutdown）。每次调用起一个 daemon 线程，开销可忽略。
+    """
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["result"] = func()
+        except BaseException as e:  # 含 socket.timeout / RemoteDisconnected 等
+            box["error"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError(f"akshare 调用 {timeout}s 超时（东财可能限流/挂起）")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _retry(func: Callable[[], Any], retries: int = 3, delay: float = 2, timeout: float = 8) -> Any:
+    """指数退避 + 抖动重试，每次尝试有线程级硬超时兜底。
+
+    - 退避：``delay*2^attempt + 抖动[0,delay]``，避免冷却期密集重试加剧东财限流。
+    - 超时：akshare 挂起不受 socket 超时约束 → 每次尝试 ``_run_timeout`` 兜底（超时
+      抛 TimeoutError，而非无限挂起），让重试 / 腾讯备源得以触发。
+    指数日K有腾讯备源，调用方传 ``retries=1`` 快速失败让备源接管。
+    """
     for i in range(retries):
         try:
-            return func()
+            return _run_timeout(func, timeout)
         except Exception as e:
             if i == retries - 1:
                 raise
-            logger.warning(f"{func.__name__} 第{i+1}次失败: {e}，{delay}s后重试")
-            time.sleep(delay)
+            backoff = delay * (2 ** i) + random.uniform(0, delay)
+            name = getattr(func, "__name__", "<lambda>")
+            logger.warning(f"{name} 第{i+1}次失败: {e}，{backoff:.1f}s后重试")
+            time.sleep(backoff)
 
 
 class AKShareFetcher(BaseFetcher):
     """封装AKShare接口，统一返回pandas DataFrame"""
     name = "akshare"
 
-    def get_stock_list(self) -> pd.DataFrame:
-        """获取A股全量股票列表，返回 code/name/market/industry/list_date"""
+    def get_stock_list(self, include_delisted: bool = False) -> pd.DataFrame:
+        """获取A股股票列表，返回 code/name/market。
+
+        ``include_delisted`` 为兼容路由签名而保留——**akshare 的 ``stock_info_a_code_name``
+        仅返回在市股，无法获取退市股**。消除幸存者偏差需切换主源为 tushare
+        （见 TushareFetcher.get_stock_list）。此处忽略该参数并记录。
+        """
         import akshare as ak
+        if include_delisted:
+            logger.warning("akshare 源无法获取退市股（幸存者偏差无法消除）；"
+                           "请在数据管理页把 stock_list 主源切到 tushare 后重拉。")
         df = _retry(lambda: ak.stock_info_a_code_name())
         df = df.rename(columns={"code": "code", "name": "name"})
         # 补充市场标识
@@ -74,6 +157,50 @@ class AKShareFetcher(BaseFetcher):
         df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
         return df[["code", "trade_date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]]
 
+    def get_index_daily_bars(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """获取指数日K线（沪深300/上证指数/创业板指/中证500 等），用于回测基准。
+
+        akshare 的 ``stock_zh_a_hist`` 不支持指数代码，故改用 ``index_zh_a_hist``。
+        返回与 ``get_daily_bars`` 完全一致的 schema（code/trade_date/open/high/low/
+        close/volume/amount/pct_chg），便于复用存储与下游。
+        """
+        import akshare as ak
+        # 指数日K有腾讯实时备源（见 manager._fill_indices_from_tencent），故
+        # retries=1 快速失败让备源接管——限流时不必 3 次指数退避拖慢页面（4 指数
+        # 串行 ×3×退避会到 ~30s）。回测基准也走此方法，偶发抖动丢失基准可优雅降级。
+        df = _retry(
+            lambda: ak.index_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start_date.replace("-", ""),
+                end_date=end_date.replace("-", ""),
+            ),
+            retries=1,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={
+            "日期": "trade_date",
+            "开盘": "open",
+            "最高": "high",
+            "最低": "low",
+            "收盘": "close",
+            "成交量": "volume",
+            "成交额": "amount",
+        })
+        df["code"] = code
+        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        if "pct_chg" not in df.columns:
+            df["pct_chg"] = df["close"].pct_change().fillna(0.0) * 100
+        cols = [c for c in ["code", "trade_date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]
+                if c in df.columns]
+        return df[cols]
+
     def get_financial_indicators(self, code: str) -> pd.DataFrame:
         """获取个股基本面指标（PE/PB/ROE/市值等）"""
         import akshare as ak
@@ -103,10 +230,10 @@ class AKShareFetcher(BaseFetcher):
         df = df.rename(columns={"代码": "code", "名称": "name"})
         return df[["code", "name"]]
 
-    def get_industry_list(self) -> pd.DataFrame:
-        """获取东方财富行业板块列表"""
+    def get_industry_list(self, retries: int = 3) -> pd.DataFrame:
+        """获取东方财富行业板块列表（retries 可调；市场快照传 1 快速失败降级）。"""
         import akshare as ak
-        df = _retry(lambda: ak.stock_board_industry_name_em())
+        df = _retry(lambda: ak.stock_board_industry_name_em(), retries=retries)
         return df
 
     def get_realtime_quotes(self, codes: list) -> pd.DataFrame:

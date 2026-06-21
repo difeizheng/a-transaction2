@@ -113,6 +113,116 @@ class LLMAnalyzer:
         except Exception:
             return {"sentiment": "neutral", "summary": raw[:200], "key_events": []}
 
+    def summarize_market(
+        self,
+        news_list: List[dict],
+        temperature: float,
+        label: str,
+        index_moves: dict = None,
+        top_sectors: list = None,
+    ) -> dict:
+        """给定**已由数据算出**的情绪温度，让 LLM 只产出定性总结 + 关键事件。
+
+        温度来自 ``sentiment.compute_market_temperature``（真实指数/板块数据），
+        本方法**不让 LLM 给分**——明确告知温度已算好，只产出 100 字内总结与
+        关键事件列表。保持总 LLM 调用 = 1（与改造前一致，积分不增）。
+
+        Returns:
+            ``{summary: str, key_events: list[str]}``
+        """
+        news_text = "\n".join([
+            f"- [{n.get('publish_time', '')}] {n.get('title', '')}"
+            for n in (news_list or [])[:20]
+        ]) or "暂无财经新闻"
+
+        label_cn = {"bullish": "偏多（看涨）", "bearish": "偏空（看跌）", "neutral": "中性"}.get(label, "中性")
+        index_desc = ""
+        if index_moves:
+            parts = [f"{c} {v:+.2f}%" for c, v in index_moves.items()]
+            index_desc = f"\n主要指数涨跌：{', '.join(parts)}"
+        sector_desc = ""
+        if top_sectors:
+            sector_desc = f"\n领涨板块：{', '.join(top_sectors)}"
+
+        prompt = f"""你是一位专业的A股市场分析师。市场情绪温度已由真实行情数据算出，**请不要输出任何分数**，只基于下列信息产出定性解读。
+
+市场情绪温度：{temperature:.1f} / 100（{label_cn}）
+{index_desc}{sector_desc}
+
+近期新闻：
+{news_text}
+
+请以JSON格式返回（不要有其他内容，不要包含任何数字评分）：
+{{
+  "summary": "100字以内的市场情绪定性总结（结合温度方向与新闻）",
+  "key_events": ["关键事件1", "关键事件2", "关键事件3"]
+}}"""
+        raw = self.call(prompt)
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            data = json.loads(raw[start:end])
+            return {
+                "summary": data.get("summary", ""),
+                "key_events": data.get("key_events", []),
+            }
+        except Exception:
+            return {"summary": raw[:200], "key_events": []}
+
+    def summarize_macro(
+        self,
+        score: float,
+        label: str,
+        components: dict,
+        indicators: dict,
+        news_list: List[dict],
+    ) -> dict:
+        """给定**已由数据算出**的宏观态势分，让 LLM 只产出综合定性 + 政策面 + 关键风险。
+
+        态势分来自 ``macro.compute_macro_stance``（真实四支柱数据），本方法**不让
+        LLM 给分**——明确告知分已算好，只产出定性解读。政策面（央行/国常会/监管动向）
+        是纯函数算不了的，正由 LLM 从近期新闻提炼。保持总 LLM 调用 = 1。
+
+        Returns:
+            ``{summary: str, policy_read: str, key_risks: list[str]}``
+        """
+        news_text = "\n".join([
+            f"- [{n.get('publish_time', '')}] {n.get('title', '')}"
+            for n in (news_list or [])[:20]
+        ]) or "暂无财经新闻"
+
+        label_cn = {"bullish": "宽松积极", "bearish": "偏紧", "neutral": "中性"}.get(label, "中性")
+        comp_desc = "；".join(
+            f"{p} {v['signal']:+.2f}" for p, v in (components or {}).items()
+        ) or "无"
+
+        prompt = f"""你是一位专业的A股宏观分析师。宏观态势分已由真实数据算出，**请不要输出任何分数**，只基于下列支柱信号 + 近期政策新闻产出定性解读。
+
+宏观态势分：{score:.1f} / 100（{label_cn}）
+支柱信号（-1 偏空 ~ +1 偏多）：{comp_desc}
+
+近期新闻：
+{news_text}
+
+请以JSON格式返回（不要有其他内容，不要包含任何数字评分）：
+{{
+  "summary": "100字以内的宏观综合定性（结合四支柱信号与当前经济/政策环境）",
+  "policy_read": "80字以内的政策面解读（央行/国常会/监管近期动向对A股的含义）",
+  "key_risks": ["关键风险1", "关键风险2", "关键风险3"]
+}}"""
+        raw = self.call(prompt)
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            data = json.loads(raw[start:end])
+            return {
+                "summary": data.get("summary", ""),
+                "policy_read": data.get("policy_read", ""),
+                "key_risks": data.get("key_risks", []),
+            }
+        except Exception:
+            return {"summary": raw[:200], "policy_read": "", "key_risks": []}
+
     def analyze_stock_trend(
         self,
         code: str,
