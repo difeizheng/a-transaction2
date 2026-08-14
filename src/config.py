@@ -66,3 +66,15 @@ def get_config() -> dict:
     if _config is None:
         _config = load_config()
     return _config
+
+
+def reload_config() -> dict:
+    """清除缓存并重新加载配置（含 .env 与环境变量覆盖），返回新配置。
+
+    UI 设置页保存配置后调用，避免「改配置必须重启进程」。
+    注意：``.env`` 加载是 setdefault 语义——已存在于 ``os.environ`` 的键
+    不会被新值覆盖；若改了 .env 中已注入过进程的密钥，仍需重启进程。
+    """
+    global _config
+    _config = None
+    return get_config()

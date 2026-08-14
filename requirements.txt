@@ -1,14 +1,21 @@
-akshare>=1.12.0
-backtrader>=1.9.78
-streamlit>=1.30.0
-anthropic>=0.40.0
-openai>=1.0.0
-pandas>=2.0.0
-plotly>=5.18.0
-pandas-ta>=0.3.14
-sqlalchemy>=2.0.0
-pyyaml>=6.0
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
-numpy>=1.24.0
+# 运行时依赖 —— 精确锁定（2026-06-22，与开发环境 pip freeze 对齐）。
+# 锁定原因：backtrader / pandas-ta 已停止维护，浮动版本会在某次重装时引入
+# 不可预期的破坏；锁版本保证 CI 与新机器复现同一环境。
+# 升级方法：单独升级某个包 → 跑全量 pytest → 更新此处版本号。
+akshare==1.18.40
+backtrader==1.9.78.123
+streamlit==1.58.0
+anthropic==0.87.0
+openai==2.24.0
+pandas==2.2.0
+plotly==6.6.0
+pandas-ta==0.4.71b0
+sqlalchemy==2.0.25
+pyyaml==6.0.3
+requests==2.34.2
+beautifulsoup4==4.14.3
+lxml==6.1.1
+numpy==1.26.4
+# tushare 是 tushare_fetcher 的硬依赖（配置了 TUSHARE_TOKEN 才启用），
+# 此前漏列——浮动安装时会 ImportError。
+tushare==1.4.25

@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # 测试套件零网络/LLM 依赖（见 pytest.ini markers 约定），可直接在 CI 跑全量。
+      # 先单跑 unit 快速失败，再跑全量（含 SQLite 集成）。
+      - name: Unit tests (fail fast)
+        run: pytest -m unit
+
+      - name: Full suite
+        run: pytest

@@ -44,7 +44,7 @@ There is still **no linter or type-checker configured**. Tests target pure logic
 
 ## Configuration
 
-`config/config.yaml` is the single config surface, loaded by `src/config.py` (`get_config()`, cached). Secrets are injected via environment variables with precedence **real `os.environ` > `.env` file (project root) > `config.yaml` placeholder**. `config.py` ships a dependency-free `.env` loader (no `python-dotenv`). Supported vars: `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `TUSHARE_TOKEN`.
+`config/config.yaml` is the single config surface, loaded by `src/config.py` (`get_config()`, 进程级缓存——运行时改配置后调 `reload_config()` 重载；但 .env 已注入进程的密钥键仍需重启才能换值）。 Secrets are injected via environment variables with precedence **real `os.environ` > `.env` file (project root) > `config.yaml` placeholder**. `config.py` ships a dependency-free `.env` loader (no `python-dotenv`). Supported vars: `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `TUSHARE_TOKEN`.
 
 - `llm.provider`: `claude` or `openai` — switches `LLMAnalyzer` between Anthropic and any OpenAI-compatible endpoint
 - `llm.openai_base_url`: points `LLMAnalyzer` at third-party OpenAI-compatible APIs (e.g. SiliconFlow); `model_openai` is the model id passed there
@@ -65,6 +65,8 @@ src/data/
 ├── tushare_fetcher.py  # TushareFetcher (requires token, high-quality bars/financials)
 ├── tencent_fetcher.py  # TencentFetcher (free realtime quotes)
 ├── cninfo_fetcher.py   # CninfoFetcher (巨潮 announcements, free)
+├── pit.py              # PIT 过滤纯函数：ann_date<=决策日（堵财务前视偏差）
+├── market_indices.py   # 指数/市场宽度数据
 ├── source_router.py    # SourceRouter: primary/backup failover per data_type
 ├── storage.py          # SQLAlchemy Core over SQLite (all tables)
 └── manager.py          # DataManager: orchestrates router + storage, incremental updates
@@ -91,8 +93,12 @@ src/strategy/
 ├── technical.py     # MA cross, MACD golden, KDJ oversold, Bollinger breakout
 ├── fundamental.py   # Low valuation, high growth, industry leader
 ├── multifactor.py   # Z-score normalized multi-factor model
+├── smallcap.py      # SmallCapStrategy（A 股小市值溢价因子）
+├── neutralize.py    # 行业/风格中性化纯函数（group demean+winsorize / OLS 残差）
 └── screener.py      # Screener + STRATEGY_REGISTRY (the strategy registration point)
 ```
+
+技术策略同时实现 `evaluate_exit()`（对称出场信号 `ExitSignal`：如 ma_cross 跌破 MA20、macd_golden 死叉）。`kdj_oversold`/`boll_breakout` 已标记 `is_deprecated`，`list_strategies(active_only=True)` 默认排除。
 
 Two evaluation modes on `BaseStrategy`:
 - `screen(stock_pool, data_manager, progress_callback) -> List[ScreenResult]` — batch screen over a pool (abstract, required).
@@ -102,30 +108,31 @@ Two evaluation modes on `BaseStrategy`:
 
 ### Backtest
 
-`BacktestEngine` (backtrader wrapper) + `BTStrategyWrapper` adapts a `BaseStrategy` to a backtrader `Strategy`. `BacktestComparator` runs several strategies and persists results to `backtest_results`.
+`BacktestEngine` (backtrader wrapper) + `BTStrategyWrapper` adapts a `BaseStrategy` to a backtrader `Strategy`. **引擎复用实盘约束**（与 `trading/` 同一套规则，杜绝「回测放水」）：T+1（买入当 bar 不可卖）、涨跌停/一字板过滤（涨停买不进、跌停卖不掉）、滑点（`set_slippage_perc`）、过户费、单笔成交量 ≤ 当日 25%（`cap_size_by_volume`）、非对称印花税。 `BacktestComparator` runs several strategies and persists results to `backtest_results`.
 
 ### Analysis
 
-`LLMAnalyzer` is the provider abstraction (`_call_claude` / `_call_openai`, plus `_chat_*` for message-array/system-prompt calls). `Advisor` orchestrates news fetch + LLM calls into a structured result (`buy_suggestion`, `confidence`) that `AutoTrader` consumes.
+`LLMAnalyzer` is the provider abstraction (`_call_claude` / `_call_openai`, plus `_chat_*` for message-array/system-prompt calls). `Advisor` orchestrates news fetch + LLM calls into a structured result (`buy_suggestion`, `confidence`) —— 仅作展示注释，不再是 AutoTrader 的决策门。`macro.py`/`sentiment.py` 为宏观与情绪的纯函数算分（LLM 仅润色）；`factor_research.py` 做因子 IC/IR 检验与分层多空；`attribution.py` 做 Brinson-Fachler 绩效归因。
 
 ### Trading
 
 ```
 src/trading/
 ├── rules.py        # A-share rules: price-limit %, commission, stamp duty, T+1, lot rounding
+├── risk.py         # 风控纯函数：回撤(high-water mark)/成交量上限/回撤分档减仓/行业集中度
 ├── portfolio.py    # Portfolio: buy/sell/positions/P&L, persists orders+positions to SQLite
 ├── simulator.py    # TradingSimulator: wraps Portfolio with realtime price lookup
-└── auto_trader.py  # AutoTrader: 4-phase automated trading loop
+└── auto_trader.py  # AutoTrader: 信号生成器（默认 auto_execute=False）
 ```
 
-`AutoTrader.run()` is a 4-phase pipeline gated by `RiskParams` (max position %, total position %, daily trade cap, stop-loss/take-profit %, max drawdown pause, min AI confidence):
-1. **Stop-loss/take-profit** — scan existing positions (only `available` shares; T+1), auto-sell beyond thresholds.
-2. **Max-drawdown check** — pause new entries if portfolio drawdown exceeds the limit.
-3. **Strategy screening** — run each strategy's `evaluate_stock` over the pool, collect candidates.
-4. **AI analysis** → `buy_suggestion == "建议买入"` and `confidence >= min_ai_confidence`.
-5. **Risk filter + execute** — enforce per-stock and total position caps and the daily-trade cap, then `place_buy`.
+`AutoTrader` 默认是**信号生成器**（`auto_execute=False`，2026-06 方案 B 重构）：`run()` 执行「止盈止损扫描 → high-water mark 回撤检查 → 回撤分档减仓 → 策略筛选 → 风控预算」后产出 buy/sell **建议报告**（落库 `execution_reports` 表，可审计回放），不自动下单。传 `auto_execute=True` 才会真实下单（纸面模拟盘自动化，风险自担）。
 
-Everything is recorded in the `ExecutionReport` dataclass. A-share T+1 is enforced in `Portfolio.buy()` (`available=0` until `end_of_day()` unlocks shares), and board-specific price limits (主板 ±10%, 创业板/科创板 ±20%, 北交所 ±30%) are enforced in `simulator.py`.
+关键设计：
+- **LLM 不再是决策门**：`Advisor` 的分析仅作展示注释（只注释得分最高的 `AI_ANALYSIS_TOP_N=5` 只，控制 token 成本）；`min_ai_confidence` 是保留的 UI 展示字段。
+- **回撤用 high-water mark 口径**（`account.peak_value` 持久化峰值），命中阈值不止暂停开仓——`risk.py` 的 5 档 `deescalation_level`/`compute_trim_quantity` 会主动减仓。
+- **风控预算**：单股/总仓位上限、单日笔数、行业集中度预检（`max_industry_pct`，`risk.py` 的 `would_breach_concentration`），加仓数量由 `compute_add_buy_quantity` 扣除已有持仓后计算。
+
+Everything is recorded in the `ExecutionReport` dataclass. A-share T+1 is enforced in `Portfolio.buy()` (`available=0` until `end_of_day()` unlocks shares)——`TradingSimulator` 构造时会**自动补做** end_of_day（解锁 `buy_date < 最近交易日` 的持仓，不再依赖 UI 手动按钮）。Board-specific price limits (主板 ±10%, 创业板/科创板 ±20%, 北交所 ±30%) are enforced in `simulator.py`。
 
 ### UI
 
@@ -135,7 +142,7 @@ Everything is recorded in the `ExecutionReport` dataclass. A-share T+1 is enforc
 
 ## SQLite schema (data/stock.db)
 
-13 tables, all created in `Storage._init_tables()`. Beyond the obvious ones (`stock_list`, `daily_bars`, `financial_data`, `news`, `backtest_results`, `trade_orders`, `positions`), note the routing/state tables the UI depends on: `data_source_routes`, `data_source_status`, `update_log`, `screening_sessions`, `screening_evaluations`, `watchlist`. Schema migrations are inline `ALTER TABLE ... ADD COLUMN` guarded by try/except (see `news.url`).
+19 tables, all created in `Storage._init_tables()`. Beyond the obvious ones (`stock_list`, `daily_bars`, `financial_data`, `news`, `backtest_results`, `trade_orders`, `positions`), note: the routing/state tables the UI depends on (`data_source_routes`, `data_source_status`, `update_log`, `screening_sessions`, `screening_evaluations`, `watchlist`), the audit/observability tables (`execution_reports`, `llm_call_log`), market-context tables (`macro_snapshot`, `market_sentiment`), and meta tables (`account` 持久化净值峰值, `schema_version`)。`daily_bars` 有 `adj_factor` 列且 upsert 为 update-existing（修 qfq 复权漂移）；`financial_data` 有 `ann_date` 列（PIT 过滤用）。 Schema migrations are inline `ALTER TABLE ... ADD COLUMN` guarded by try/except (see `news.url`).
 
 ## Adding a new strategy
 

@@ -110,3 +110,28 @@ class TestApplyEnvOverrides:
         cfg = {}
         _apply_env_overrides(cfg)
         assert "llm" not in cfg  # 不主动创建 llm 键
+
+
+# ── reload_config 缓存失效 ─────────────────────────────────────
+class TestReloadConfig:
+    @pytest.mark.unit
+    def test_reload_picks_up_file_change(self, tmp_path):
+        import src.config as cfg_mod
+
+        saved = cfg_mod._config
+        orig_path = cfg_mod._DEFAULT_CONFIG_PATH
+        cfg_file = tmp_path / "config.yaml"
+        try:
+            cfg_file.write_text("trading:\n  initial_cash: 100000\n", encoding="utf-8")
+            cfg_mod._DEFAULT_CONFIG_PATH = cfg_file
+            cfg_mod._config = None
+            assert cfg_mod.get_config()["trading"]["initial_cash"] == 100000
+
+            cfg_file.write_text("trading:\n  initial_cash: 200000\n", encoding="utf-8")
+            # 缓存生效：不重载仍读到旧值
+            assert cfg_mod.get_config()["trading"]["initial_cash"] == 100000
+            # reload 后读到新值
+            assert cfg_mod.reload_config()["trading"]["initial_cash"] == 200000
+        finally:
+            cfg_mod._DEFAULT_CONFIG_PATH = orig_path
+            cfg_mod._config = saved

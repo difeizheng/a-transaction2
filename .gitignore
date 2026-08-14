@@ -9,6 +9,9 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+data/repair.log
+data/repair_progress.json
+data/repair_bg.out
 
 # ── Python ──────────────────────────────────────────
 __pycache__/
@@ -30,3 +33,6 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# ── pi agent 本地状态（工具私有，不入库）─────────────────
+.pi/

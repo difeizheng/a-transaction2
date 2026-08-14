@@ -152,3 +152,47 @@ class TestEndToEndWithLimits:
         # 4. 正常价卖出成功
         sell_ok = sim.place_sell("000001", 100, price=10.5)
         assert sell_ok["success"] is True
+
+
+# ── 启动自动日终处理（T+1 解锁不再依赖手动按钮）────────────────
+class TestAutoEndOfDay:
+    """构造 TradingSimulator 时自动补做 end_of_day：
+    buy_date < 最近交易日 的未解锁持仓应被解锁；当日买入保持锁定。"""
+
+    @pytest.mark.integration
+    def test_stale_t1_position_unlocked_on_init(self, storage):
+        from datetime import date
+        stale_date = "2020-01-02"  # 任意早于今天的历史交易日
+        if stale_date >= date.today().isoformat():
+            pytest.skip("日期常量需早于今天")
+        storage.upsert_position({
+            "code": "000001", "name": "X", "quantity": 100, "available": 0,
+            "cost_price": 10.0, "current_price": 10.0,
+            "market_value": 1000.0, "profit_loss": 0.0, "buy_date": stale_date,
+        })
+        sim = TradingSimulator(_FakeDM(storage))
+        pos = sim.portfolio.get_position("000001")
+        assert pos["available"] == 100
+
+    @pytest.mark.integration
+    def test_today_buy_stays_locked_on_init(self, storage):
+        from datetime import date
+        storage.upsert_position({
+            "code": "000001", "name": "X", "quantity": 100, "available": 0,
+            "cost_price": 10.0, "current_price": 10.0,
+            "market_value": 1000.0, "profit_loss": 0.0,
+            "buy_date": date.today().isoformat(),
+        })
+        sim = TradingSimulator(_FakeDM(storage))
+        pos = sim.portfolio.get_position("000001")
+        assert pos["available"] == 0
+
+    @pytest.mark.integration
+    def test_already_unlocked_position_untouched(self, storage):
+        storage.upsert_position({
+            "code": "000001", "name": "X", "quantity": 100, "available": 100,
+            "cost_price": 10.0, "current_price": 10.0,
+            "market_value": 1000.0, "profit_loss": 0.0, "buy_date": "2020-01-02",
+        })
+        sim = TradingSimulator(_FakeDM(storage))
+        assert sim._auto_end_of_day_if_stale() == 0  # 幂等：无可解锁
