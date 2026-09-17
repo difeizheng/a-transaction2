@@ -199,3 +199,34 @@ class TestBacktestEngine:
 
         assert result["trades"] == 0
         assert result["final_value"] == pytest.approx(1_000_000.0, abs=1.0)  # 无交易，资金不变
+
+
+class TestTradesDetail:
+    @pytest.mark.integration
+    def test_closed_trade_recorded(self):
+        # 30 天从 10 涨到 13（+30% > take_profit 15%）→ 触发止盈平仓，
+        # trades_detail 应含一条平仓记录，字段齐全且 pnl 为正。
+        import json
+        config = {"backtest": {"initial_cash": 1_000_000.0,
+                               "commission": 0.0003, "stamp_duty": 0.001}}
+        engine = BacktestEngine(config)
+        dates = pd.date_range("2024-01-01", periods=30, freq="D")
+        prices = [10.0 + i * 0.1 for i in range(30)]
+        bars = {"000001": pd.DataFrame({
+            "trade_date": dates, "open": prices,
+            "high": [p + 0.2 for p in prices], "low": [p - 0.2 for p in prices],
+            "close": prices, "volume": [1_000_000] * 30,
+        })}
+        result = engine.run(bars_dict=bars, signal_codes=["000001"],
+                            start_date="2024-01-01", end_date="2024-01-31",
+                            stop_loss=0.05, take_profit=0.15,
+                            strategy_name="t")
+        detail = json.loads(result["trades_detail"])
+        assert result["trades"] >= 1
+        assert len(detail) >= 1
+        t = detail[0]
+        assert t["code"] == "000001"
+        assert t["size"] > 0 and t["size"] % 100 == 0
+        assert t["pnlcomm"] > 0
+        assert t["close_date"] >= t["open_date"]
+        assert t["open_price"] > 0

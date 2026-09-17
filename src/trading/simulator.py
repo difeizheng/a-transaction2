@@ -126,4 +126,28 @@ class TradingSimulator:
     def end_of_day(self):
         """日终处理（手动触发或定时调用）"""
         self.portfolio.end_of_day(date.today().isoformat())
+        self.snapshot_equity()
         logger.info("日终处理完成，T+1限制已更新")
+
+    def snapshot_equity(self, snap_date: str = None) -> dict:
+        """记录当日净值快照到 ``equity_snapshots`` 表（同日幂等覆盖）。
+
+        净值曲线的数据底座：dashboard / 模拟交易页读取该表画净值与回撤。
+        失败（如行情源不可用）只告警不抛——快照是观测性数据，不能阻断主流程。
+
+        Returns:
+            写入的快照 dict；失败返回 None。
+        """
+        try:
+            summary = self.get_portfolio_summary()
+            snap = {
+                "date": snap_date or date.today().isoformat(),
+                "total_value": summary["total_value"],
+                "cash": summary["cash"],
+                "market_value": summary["market_value"],
+            }
+            self.portfolio.storage.upsert_equity_snapshot(snap)
+            return snap
+        except Exception as e:
+            logger.warning(f"净值快照记录失败（不影响使用）: {e}")
+            return None

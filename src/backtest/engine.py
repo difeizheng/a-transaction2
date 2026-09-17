@@ -1,5 +1,6 @@
 """Backtrader回测引擎封装"""
 import logging
+import json
 from datetime import datetime
 from typing import List, Optional
 import pandas as pd
@@ -82,6 +83,8 @@ class BTStrategyWrapper(bt.Strategy):
         self.buy_prices = {}
         self.traded_once = set()  # 已建过仓的代码，卖出后不回补，避免无限循环放大交易次数
         self._buy_bar = {}        # code -> 买入决策 bar 序号（T+1 判定）
+        self._open_lots = {}      # code -> (open_date, open_price, size)，供逐笔交易记录
+        self._closed_trades = []  # 已平仓交易明细（UI 下钻用）
 
     def next(self):
         for i, data in enumerate(self.datas):
@@ -127,6 +130,33 @@ class BTStrategyWrapper(bt.Strategy):
         if order.status in [order.Completed]:
             action = "买入" if order.isbuy() else "卖出"
             logger.debug(f"{order.data._name} {action} {order.executed.size}股 @{order.executed.price:.2f}")
+            if order.isbuy():
+                d = bt.num2date(order.executed.dt).date().isoformat()
+                self._open_lots[order.data._name] = (
+                    d, float(order.executed.price), int(order.executed.size))
+
+    def notify_trade(self, trade):
+        """平仓时记录逐笔交易（供 UI「交易明细下钻」与复盘）。
+
+        本策略每股同时只有一仓（next() 仅在 pos.size==0 时买入），
+        故 _open_lots 按 code 单条对应，无需 FIFO 队列。
+        """
+        if not trade.isclosed:
+            return
+        code = trade.data._name
+        open_date, open_price, size = self._open_lots.pop(
+            code, (bt.num2date(trade.dtopen).date().isoformat(), float(trade.price), 0))
+        close_price = round(open_price + trade.pnl / size, 3) if size else None
+        self._closed_trades.append({
+            "code": code,
+            "open_date": open_date,
+            "close_date": bt.num2date(trade.dtclose).date().isoformat(),
+            "open_price": round(open_price, 3),
+            "close_price": close_price,
+            "size": size,
+            "pnl": round(float(trade.pnl), 2),
+            "pnlcomm": round(float(trade.pnlcomm), 2),
+        })
 
 
 # ── 净值曲线分析器 ─────────────────────────────────────────────────
@@ -260,6 +290,8 @@ class BacktestEngine:
             "win_rate": round(win_rate, 1),
             "profit_loss_ratio": round(profit_loss_ratio, 2),
             "trades": total_trades,
+            # 逐笔平仓明细（JSON 字符串，随 save_backtest_result 落库 trades_detail 列）
+            "trades_detail": json.dumps(strat._closed_trades, ensure_ascii=False),
             "equity_curve": {
                 "dates": equity.get("dates", []),
                 "values": equity.get("values", []),

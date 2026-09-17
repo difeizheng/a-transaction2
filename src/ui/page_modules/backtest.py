@@ -1,9 +1,18 @@
-"""策略回测页面"""
-import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
+"""策略回测页面
 
-from src.data.manager import DataManager
+重构要点：
+- 默认回测区间动态化（结束=今天，开始=3 年前），不再写死 2022~2024；
+- 历史记录支持「交易明细下钻」（trades_detail 列，引擎 notify_trade 收集）；
+- 任选两条历史记录并排对比（指标 delta）；
+- 历史记录渲染移到结果之后，去掉原先 empty 占位双渲染的时序 hack。
+"""
+import json
+from datetime import date, timedelta
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
 from src.backtest.compare import BacktestComparator
 from src.backtest.metrics import (
     BENCHMARK_NAMES,
@@ -11,15 +20,9 @@ from src.backtest.metrics import (
     low_trade_warnings,
     pick_best_strategy,
 )
-from src.config import get_config
+from src.ui.components.service_info import get_akshare_info, render_service_info
 from src.ui.components.step_logger import StepLogger
-from src.ui.components.service_info import render_service_info, get_akshare_info
-
-
-@st.cache_resource
-def get_dm():
-    return DataManager()
-
+from src.ui.core import get_config, get_dm
 
 STRATEGY_OPTIONS = {
     "ma_cross": "均线多头排列",
@@ -30,6 +33,13 @@ STRATEGY_OPTIONS = {
     "multi_factor": "多因子模型",
 }
 
+_METRIC_ROWS = [
+    ("total_return", "总收益(%)"), ("annual_return", "年化(%)"),
+    ("sharpe", "夏普"), ("max_drawdown", "最大回撤(%)"),
+    ("win_rate", "胜率(%)"), ("profit_loss_ratio", "盈亏比"),
+    ("trades", "交易次数"),
+]
+
 
 def render_sidebar():
     st.subheader("回测参数")
@@ -39,9 +49,11 @@ def render_sidebar():
         default=["ma_cross", "multi_factor"],
         format_func=lambda x: STRATEGY_OPTIONS.get(x, x),
     )
+    today = date.today()
     col1, col2 = st.columns(2)
-    st.session_state["backtest_start"] = col1.date_input("开始日期", value=pd.Timestamp("2022-01-01"))
-    st.session_state["backtest_end"] = col2.date_input("结束日期", value=pd.Timestamp("2024-12-31"))
+    st.session_state["backtest_start"] = col1.date_input(
+        "开始日期", value=today - timedelta(days=3 * 365))
+    st.session_state["backtest_end"] = col2.date_input("结束日期", value=today)
     st.session_state["backtest_stop_loss"] = st.slider("止损比例(%)", 3, 20, 5) / 100
     st.session_state["backtest_take_profit"] = st.slider("止盈比例(%)", 5, 50, 15) / 100
     st.session_state["backtest_top_n"] = st.slider("每策略选股数量", 5, 30, 10)
@@ -55,27 +67,6 @@ def render_sidebar():
 
     st.divider()
     render_service_info([get_akshare_info()])
-
-
-def _render_history(spot, dm):
-    """渲染历史回测记录到占位容器。可重复调用以反映最新写入。"""
-    with spot.container():
-        st.subheader("历史回测记录")
-        history = dm.storage.get_backtest_results()
-        if not history.empty:
-            display_cols = [c for c in ["strategy_name", "start_date", "end_date", "total_return",
-                                        "annual_return", "sharpe", "max_drawdown", "win_rate", "trades"]
-                            if c in history.columns]
-            rename = {
-                "strategy_name": "策略", "start_date": "开始", "end_date": "结束",
-                "total_return": "总收益(%)", "annual_return": "年化(%)",
-                "sharpe": "夏普", "max_drawdown": "最大回撤(%)",
-                "win_rate": "胜率(%)", "trades": "交易次数",
-            }
-            st.dataframe(history[display_cols].rename(columns=rename),
-                         use_container_width=True, hide_index=True)
-        else:
-            st.caption("暂无历史记录")
 
 
 def _equity_chart(bt, benchmark):
@@ -132,26 +123,109 @@ def _risk_return_scatter(rows):
     return fig
 
 
+def _record_label(row) -> str:
+    name = STRATEGY_OPTIONS.get(row["strategy_name"], row["strategy_name"])
+    return (f"#{row['id']} {name} | {row['start_date']}~{row['end_date']} "
+            f"| 收益 {row['total_return']}% | {str(row.get('created_at', ''))[:16]}")
+
+
+def _render_trade_drilldown(history: pd.DataFrame) -> None:
+    """交易明细下钻：选一条历史记录，展开逐笔平仓交易。"""
+    st.markdown("**🔍 交易明细下钻**")
+    options = { _record_label(r): r["id"] for _, r in history.iterrows() }
+    choice = st.selectbox("选择一条回测记录", list(options.keys()),
+                          index=None, placeholder="选择记录查看逐笔交易…")
+    if choice is None:
+        return
+    row = history[history["id"] == options[choice]].iloc[0]
+    raw = row.get("trades_detail")
+    if not raw or (isinstance(raw, float) and pd.isna(raw)):
+        st.caption("该记录无逐笔明细（旧格式回测结果；重新运行回测后即有）")
+        return
+    trades = json.loads(raw)
+    if not trades:
+        st.caption("本次回测无平仓交易")
+        return
+    tdf = pd.DataFrame(trades).rename(columns={
+        "code": "代码", "open_date": "买入日", "close_date": "卖出日",
+        "open_price": "买入价", "close_price": "卖出价",
+        "size": "数量", "pnl": "毛利", "pnlcomm": "净利(含费用)",
+    })
+    st.dataframe(tdf, use_container_width=True, hide_index=True)
+    total = tdf["净利(含费用)"].sum()
+    win = (tdf["净利(含费用)"] > 0).sum()
+    st.caption(f"共 {len(tdf)} 笔平仓：盈利 {win} 笔 / 亏损 {len(tdf) - win} 笔，"
+               f"合计净利 ¥{total:,.0f}")
+
+
+def _render_run_comparison(history: pd.DataFrame) -> None:
+    """任选两条历史记录并排对比（含指标 delta）。"""
+    st.markdown("**⚖️ 两次回测对比**")
+    options = {_record_label(r): r["id"] for _, r in history.iterrows()}
+    picks = st.multiselect("选择两条记录对比", list(options.keys()), max_selections=2)
+    if len(picks) != 2:
+        st.caption("选择两条记录后展示对比")
+        return
+    rows = [history[history["id"] == options[p]].iloc[0] for p in picks]
+    table = {"指标": [label for _, label in _METRIC_ROWS]}
+    for i, r in enumerate(rows):
+        table[f"记录{chr(65 + i)}"] = [r.get(k) for k, _ in _METRIC_ROWS]
+    deltas = []
+    for k, _ in _METRIC_ROWS:
+        a, b = rows[0].get(k), rows[1].get(k)
+        try:
+            deltas.append(round(float(b) - float(a), 2))
+        except (TypeError, ValueError):
+            deltas.append(None)
+    table["差异(B-A)"] = deltas
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+
+
+def _render_history(dm) -> None:
+    st.subheader("历史回测记录")
+    history = dm.storage.get_backtest_results()
+    if history.empty:
+        st.caption("暂无历史记录")
+        return
+    display_cols = [c for c in ["strategy_name", "start_date", "end_date", "total_return",
+                                "annual_return", "sharpe", "max_drawdown", "win_rate", "trades"]
+                    if c in history.columns]
+    rename = {
+        "strategy_name": "策略", "start_date": "开始", "end_date": "结束",
+        "total_return": "总收益(%)", "annual_return": "年化(%)",
+        "sharpe": "夏普", "max_drawdown": "最大回撤(%)",
+        "win_rate": "胜率(%)", "trades": "交易次数",
+    }
+    st.dataframe(history[display_cols].rename(columns=rename),
+                 use_container_width=True, hide_index=True)
+
+    tab_drill, tab_cmp = st.tabs(["交易明细下钻", "两次回测对比"])
+    with tab_drill:
+        _render_trade_drilldown(history)
+    with tab_cmp:
+        _render_run_comparison(history)
+
+
 def render():
     st.title("📉 策略回测")
     dm = get_dm()
     cfg = get_config()
 
-    # 顶部历史记录占位：跑回测前先渲染一次，跑完后再刷新以纳入本次写入
-    hist_spot = st.empty()
-    _render_history(hist_spot, dm)
+    if st.session_state.get("backtest_run"):
+        _run_backtest(dm, cfg)
 
-    if not st.session_state.get("backtest_run"):
-        st.info("在左侧配置回测参数后点击「运行回测」")
-        return
+    # 历史记录放最后：运行完回测自然渲染到最新数据（含本次写入）
+    _render_history(dm)
 
+
+def _run_backtest(dm, cfg) -> None:
     selected = st.session_state.get("backtest_strategies", [])
     if not selected:
         st.warning("请至少选择一个策略")
         return
 
-    start_date = str(st.session_state.get("backtest_start", "2022-01-01"))
-    end_date = str(st.session_state.get("backtest_end", "2024-12-31"))
+    start_date = str(st.session_state.get("backtest_start"))
+    end_date = str(st.session_state.get("backtest_end"))
     stop_loss = st.session_state.get("backtest_stop_loss", 0.05)
     take_profit = st.session_state.get("backtest_take_profit", 0.15)
     top_n = st.session_state.get("backtest_top_n", 10)
@@ -215,7 +289,7 @@ def render():
     if eq_fig is not None:
         st.plotly_chart(eq_fig, use_container_width=True)
 
-    # ④ 风险-收益散点（替换原先量纲混乱的柱状图）
+    # ④ 风险-收益散点
     rr_fig = _risk_return_scatter(rows)
     if rr_fig is not None:
         st.plotly_chart(rr_fig, use_container_width=True)
@@ -261,6 +335,3 @@ def render():
                     )
                 else:
                     st.caption("无")
-
-    # ⑧ 刷新历史记录，纳入本次结果（修复此前"本次记录要等下次刷新才出现"的时序问题）
-    _render_history(hist_spot, dm)

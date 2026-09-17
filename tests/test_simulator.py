@@ -196,3 +196,23 @@ class TestAutoEndOfDay:
         })
         sim = TradingSimulator(_FakeDM(storage))
         assert sim._auto_end_of_day_if_stale() == 0  # 幂等：无可解锁
+
+
+# ── 净值快照（净值曲线数据底座）────────────────────────────────
+class TestEquitySnapshot:
+    @pytest.mark.integration
+    def test_snapshot_writes_row(self, sim):
+        snap = sim.snapshot_equity("2026-07-23")
+        assert snap is not None
+        df = sim.portfolio.storage.get_equity_snapshots()
+        assert len(df) == 1
+        assert df.iloc[0]["date"] == "2026-07-23"
+        assert df.iloc[0]["total_value"] == snap["total_value"]
+
+    @pytest.mark.integration
+    def test_end_of_day_also_snapshots(self, sim):
+        sim.end_of_day()
+        from datetime import date
+        df = sim.portfolio.storage.get_equity_snapshots()
+        assert len(df) == 1
+        assert df.iloc[0]["date"] == date.today().isoformat()

@@ -28,7 +28,7 @@ PAGES = {
     "选股筛选":   {"label": "🔍 选股筛选",   "module": "src.ui.page_modules.screener"},
     "自选股":     {"label": "⭐ 自选股",     "module": "src.ui.page_modules.watchlist"},
     "策略回测":   {"label": "📉 策略回测",   "module": "src.ui.page_modules.backtest"},
-    "市场分析":   {"label": "🤖 市场分析",   "module": "src.ui.page_modules.analysis"},
+    "市场分析":   {"label": "🤖 AI 与市场分析", "module": "src.ui.page_modules.analysis"},
     "模拟交易":   {"label": "💹 模拟交易",   "module": "src.ui.page_modules.trading"},
 }
 
@@ -44,9 +44,11 @@ with st.sidebar:
     st.divider()
 
     # 动态加载当前页面模块，调用其 render_sidebar()（如果存在）
+    from src.ui.core import page_guard
     mod = importlib.import_module(PAGES[page_key]["module"])
     if hasattr(mod, "render_sidebar"):
-        mod.render_sidebar()
+        page_guard(mod.render_sidebar)()
 
 # ── 主内容区 ──────────────────────────────────────────────────────────────
-mod.render()
+# 页面级错误边界：单页渲染异常不再拖垮整个 app（traceback 收进日志）
+page_guard(mod.render)()

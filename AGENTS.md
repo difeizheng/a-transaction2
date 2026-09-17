@@ -13,7 +13,7 @@
 ## 约定
 
 - 密钥注入优先级：真实 `os.environ` > 项目根 `.env` > `config/config.yaml` 占位符。`src/config.py` 自带零依赖 `.env` 加载器，**不要引入 python-dotenv**。新密钥走环境变量并在 `.env.example` 登记变量名。
-- UI 页面契约：在 `src/ui/page_modules/` 放模块，提供 `render()`（可选 `render_sidebar()`），并在 `app.py` 的 `PAGES` 字典注册。详见下方"坑"。
+- UI 页面契约：在 `src/ui/page_modules/` 放模块（大页可拆为同名 package，`__init__.py` 再导出 `render`/`render_sidebar`），并在 `app.py` 的 `PAGES` 字典注册。共享服务一律走 `src/ui/core.py` 的 `get_dm`/`get_simulator`/`get_advisor` 单例，**不要再在页面里各自 `@st.cache_resource` 造 DataManager**（2026-07 重构已收敛，此前 7 页 7 个 engine）。详见下方"坑"。
 - 新增策略：继承 `BaseStrategy` 实现 `screen()`，可选覆写 `evaluate_stock()`（`supports_evaluate()` 自动变 True，AutoTrader 才会用它），然后在 `src/strategy/screener.py` 的 `STRATEGY_REGISTRY` 注册——UI 无需改动。
 - 新增数据源：继承 `BaseFetcher`，不支持的 data_type **必须 raise `NotImplementedError`**（路由层靠它静默跳过该源，不算失败）；在 `DataManager.__init__` 注册并加 `data_source_routes` 行。
 - 测试只覆盖纯逻辑与 SQLite 集成（tmp_path 临时库）；**刻意不写**依赖真实网络（akshare/tushare/cninfo）、LLM API、Streamlit UI 的测试——新增测试也请保持这条边界。

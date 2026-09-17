@@ -78,6 +78,8 @@ _MIGRATIONS = [
     (3, "news URL",                             "ALTER TABLE news ADD COLUMN url TEXT DEFAULT ''"),
     (4, "positions 买入日(buy_date,T+1)",       "ALTER TABLE positions ADD COLUMN buy_date TEXT"),
     (5, "account 峰值(peak_value,回撤)",        "ALTER TABLE account ADD COLUMN peak_value REAL"),
+    (6, "backtest_results 逐笔交易(trades_detail)", "ALTER TABLE backtest_results ADD COLUMN trades_detail TEXT"),
+    (7, "watchlist 标签(tags,分组)",            "ALTER TABLE watchlist ADD COLUMN tags TEXT DEFAULT ''"),
 ]
 
 
@@ -343,6 +345,15 @@ class Storage:
                     latency_ms INTEGER,
                     success INTEGER DEFAULT 1,
                     error TEXT
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS equity_snapshots (
+                    date TEXT PRIMARY KEY,   -- YYYY-MM-DD，每日一条
+                    total_value REAL,
+                    cash REAL,
+                    market_value REAL,
+                    updated_at TEXT
                 )
             """))
             self._run_migrations(conn)
@@ -641,12 +652,42 @@ class Storage:
         return out
 
     # ── backtest_results ─────────────────────────────────────────
+    # save_backtest_result 只落库这些列（引擎 result 还含 equity_curve/initial_cash/
+    # final_value/selected_stocks 等运行期字段，不过滤会导致 to_sql 报「无此列」）。
+    _BT_RESULT_COLS = (
+        "strategy_name", "params", "start_date", "end_date", "total_return",
+        "annual_return", "sharpe", "max_drawdown", "win_rate", "profit_loss_ratio",
+        "trades", "trades_detail",
+    )
+
     def save_backtest_result(self, result: dict):
-        result["created_at"] = datetime.now().isoformat()
-        pd.DataFrame([result]).to_sql("backtest_results", self.engine, if_exists="append", index=False)
+        row = {k: result[k] for k in self._BT_RESULT_COLS if k in result}
+        row["created_at"] = datetime.now().isoformat()
+        pd.DataFrame([row]).to_sql("backtest_results", self.engine, if_exists="append", index=False)
 
     def get_backtest_results(self) -> pd.DataFrame:
         return pd.read_sql("SELECT * FROM backtest_results ORDER BY created_at DESC", self.engine)
+
+    # ── equity_snapshots（净值快照：仪表盘/模拟交易的净值曲线数据底座）──
+    def upsert_equity_snapshot(self, snap: dict) -> None:
+        """按 date 主键 upsert 当日净值快照（同日重复记录覆盖，幂等）。"""
+        snap = dict(snap)
+        snap.setdefault("updated_at", datetime.now().isoformat())
+        with self.engine.connect() as conn:
+            conn.execute(text("""
+                INSERT OR REPLACE INTO equity_snapshots
+                    (date, total_value, cash, market_value, updated_at)
+                VALUES (:date, :total_value, :cash, :market_value, :updated_at)
+            """), snap)
+            conn.commit()
+
+    def get_equity_snapshots(self, start_date: str = None) -> pd.DataFrame:
+        """按日期升序返回净值快照；``start_date``（YYYY-MM-DD）可选下界。"""
+        if start_date:
+            return pd.read_sql(
+                text("SELECT * FROM equity_snapshots WHERE date >= :d ORDER BY date"),
+                self.engine, params={"d": start_date})
+        return pd.read_sql("SELECT * FROM equity_snapshots ORDER BY date", self.engine)
 
     # ── trade_orders / positions ──────────────────────────────────
     def save_order(self, order: dict):
@@ -945,6 +986,17 @@ class Storage:
             """), rec)
             conn.commit()
 
+    def get_llm_token_usage(self, since: str) -> dict:
+        """统计 ``since``（ISO 时间串）以来的 LLM token 消耗，供 UI 成本展示。"""
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens
+                FROM llm_call_log WHERE created_at >= :since
+            """), {"since": since}).fetchone()
+        return {"calls": row[0], "input_tokens": int(row[1]), "output_tokens": int(row[2])}
+
     def get_source_routes(self) -> list:
         with self.engine.connect() as conn:
             rows = conn.execute(text("SELECT * FROM data_source_routes ORDER BY data_type")).fetchall()
@@ -1152,10 +1204,11 @@ class Storage:
         """添加或更新自选股（UNIQUE(code)，重复添加更新数据）。"""
         item.setdefault("added_at", datetime.now().isoformat())
         item.setdefault("note", "")
+        item.setdefault("tags", "")
         with self.engine.connect() as conn:
             conn.execute(text("""
-                INSERT INTO watchlist (code, name, score, signals, reason, source, note, added_at)
-                VALUES (:code, :name, :score, :signals, :reason, :source, :note, :added_at)
+                INSERT INTO watchlist (code, name, score, signals, reason, source, note, tags, added_at)
+                VALUES (:code, :name, :score, :signals, :reason, :source, :note, :tags, :added_at)
                 ON CONFLICT(code) DO UPDATE SET
                     name     = excluded.name,
                     score    = excluded.score,
@@ -1163,6 +1216,7 @@ class Storage:
                     reason   = excluded.reason,
                     source   = excluded.source,
                     added_at = excluded.added_at
+                    -- tags/note 是用户手工编辑的，重复添加不覆盖
             """), item)
             conn.commit()
 
@@ -1174,9 +1228,10 @@ class Storage:
             for item in items:
                 item.setdefault("added_at", now)
                 item.setdefault("note", "")
+                item.setdefault("tags", "")
                 conn.execute(text("""
-                    INSERT INTO watchlist (code, name, score, signals, reason, source, note, added_at)
-                    VALUES (:code, :name, :score, :signals, :reason, :source, :note, :added_at)
+                    INSERT INTO watchlist (code, name, score, signals, reason, source, note, tags, added_at)
+                    VALUES (:code, :name, :score, :signals, :reason, :source, :note, :tags, :added_at)
                     ON CONFLICT(code) DO UPDATE SET
                         name     = excluded.name,
                         score    = excluded.score,
@@ -1199,6 +1254,14 @@ class Storage:
             conn.execute(text(
                 "UPDATE watchlist SET note = :note WHERE code = :code"
             ), {"code": code, "note": note})
+            conn.commit()
+
+    def update_watchlist_tags(self, code: str, tags: str):
+        """更新自选股标签（逗号分隔字符串，如 '白马,观察'）。"""
+        with self.engine.connect() as conn:
+            conn.execute(text(
+                "UPDATE watchlist SET tags = :tags WHERE code = :code"
+            ), {"tags": tags, "code": code})
             conn.commit()
 
     def remove_from_watchlist(self, code: str):

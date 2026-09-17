@@ -143,3 +143,82 @@ class TestFinancialAnnDate:
         storage.upsert_financial_data(df2)
         fin = storage.get_financial_data("000003")
         assert fin.iloc[0]["ann_date"] == "2024-04-29"
+
+
+# ── equity_snapshots（净值曲线数据底座）────────────────────────
+class TestEquitySnapshots:
+    @pytest.mark.integration
+    def test_upsert_and_read(self, storage):
+        storage.upsert_equity_snapshot({
+            "date": "2026-07-23", "total_value": 500000.0,
+            "cash": 400000.0, "market_value": 100000.0,
+        })
+        df = storage.get_equity_snapshots()
+        assert len(df) == 1
+        assert df.iloc[0]["total_value"] == 500000.0
+
+    @pytest.mark.integration
+    def test_same_day_upsert_overwrites(self, storage):
+        for v in (500000.0, 510000.0):
+            storage.upsert_equity_snapshot({
+                "date": "2026-07-23", "total_value": v,
+                "cash": 400000.0, "market_value": v - 400000.0,
+            })
+        df = storage.get_equity_snapshots()
+        assert len(df) == 1 and df.iloc[0]["total_value"] == 510000.0
+
+    @pytest.mark.integration
+    def test_start_date_filter(self, storage):
+        for d in ("2026-07-01", "2026-07-20"):
+            storage.upsert_equity_snapshot({
+                "date": d, "total_value": 1.0, "cash": 1.0, "market_value": 0.0})
+        df = storage.get_equity_snapshots(start_date="2026-07-15")
+        assert list(df["date"]) == ["2026-07-20"]
+
+
+# ── watchlist tags（分组/筛选）─────────────────────────────────
+class TestWatchlistTags:
+    @pytest.mark.integration
+    def test_tags_column_and_update(self, storage):
+        storage.add_to_watchlist({
+            "code": "000001", "name": "平安银行", "score": 0.8,
+            "signals": "", "reason": "", "source": "manual",
+        })
+        storage.update_watchlist_tags("000001", "白马,观察")
+        items = storage.get_watchlist()
+        assert items[0]["tags"] == "白马,观察"
+
+
+# ── llm_call_log token 用量统计（QA 成本展示）──────────────────
+class TestLlmTokenUsage:
+    @pytest.mark.integration
+    def test_sum_since(self, storage):
+        storage.save_llm_call_log({"created_at": "2026-07-20T10:00:00",
+                                   "input_tokens": 100, "output_tokens": 50})
+        storage.save_llm_call_log({"created_at": "2026-07-24T10:00:00",
+                                   "input_tokens": 200, "output_tokens": 80})
+        usage = storage.get_llm_token_usage("2026-07-24T00:00:00")
+        assert usage == {"calls": 1, "input_tokens": 200, "output_tokens": 80}
+        usage_all = storage.get_llm_token_usage("2020-01-01")
+        assert usage_all["calls"] == 2 and usage_all["input_tokens"] == 300
+
+
+# ── save_backtest_result 列过滤 + trades_detail ────────────────
+class TestSaveBacktestResultFiltering:
+    @pytest.mark.integration
+    def test_engine_style_dict_with_extra_keys(self, storage):
+        # 真实 compare.py 传来的 dict 含 equity 已 pop，但仍有 initial_cash/
+        # final_value/selected_stocks/trades_detail —— 此前不过滤会直接炸。
+        storage.save_backtest_result({
+            "strategy_name": "ma_cross", "start_date": "2024-01-01",
+            "end_date": "2024-12-31", "initial_cash": 100000,
+            "final_value": 110000, "selected_stocks": 5,
+            "total_return": 10.0, "annual_return": 10.0, "sharpe": 1.0,
+            "max_drawdown": 5.0, "win_rate": 50.0, "profit_loss_ratio": 1.5,
+            "trades": 3,
+            "trades_detail": '[{"code": "000001", "pnlcomm": 123.4}]',
+        })
+        df = storage.get_backtest_results()
+        assert len(df) == 1
+        assert df.iloc[0]["strategy_name"] == "ma_cross"
+        assert "000001" in df.iloc[0]["trades_detail"]
