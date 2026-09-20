@@ -6,6 +6,7 @@
 import json
 import streamlit as st
 
+from src.ui.components.freshness import freshness_badge
 from src.ui.components.service_info import render_service_info, get_akshare_info
 from src.ui.core import get_dm
 
@@ -153,6 +154,7 @@ def render():
     dm = get_dm()
 
     items = dm.storage.get_watchlist()
+    st.caption(freshness_badge(dm.storage.get_global_latest_bar_date(), "K线数据截至"))
 
     if not items:
         st.info("自选股列表为空。在「选股筛选」页面完成筛选后，点击股票卡片上的「加入自选股」按钮，或在左侧手动添加。")
@@ -179,6 +181,73 @@ def render():
             if st.button("确认清空", type="primary", key="confirm_clear_all"):
                 dm.storage.clear_watchlist()
                 st.rerun()
+
+    # ── 批量维护标签 ──────────────────────────────────────────
+    with st.expander("🏷️ 批量维护标签"):
+        name_map = {it["code"]: it.get("name", "") for it in items}
+        bc1, bc2, bc3 = st.columns([3, 2, 2])
+        with bc1:
+            batch_codes = st.multiselect(
+                "选择股票", list(name_map.keys()),
+                format_func=lambda c: f"{name_map.get(c, '')}（{c}）")
+        with bc2:
+            batch_tags = st.text_input("标签（逗号分隔）", key="batch_tags_input",
+                                       placeholder="如 白马,观察")
+        with bc3:
+            batch_mode = st.radio("方式", ["追加", "覆盖"], horizontal=True)
+        if st.button("应用标签", key="batch_tag_apply"):
+            new_tags = [t.strip() for t in batch_tags.split(",") if t.strip()]
+            if not batch_codes or not new_tags:
+                st.warning("请先选择股票并填写标签")
+            else:
+                for c in batch_codes:
+                    if batch_mode == "追加":
+                        cur = _parse_tags(next(it for it in items if it["code"] == c))
+                        merged = ",".join(dict.fromkeys(cur + new_tags))
+                    else:
+                        merged = ",".join(new_tags)
+                    dm.storage.update_watchlist_tags(c, merged)
+                st.success(f"已{batch_mode}标签到 {len(batch_codes)} 只股票")
+                st.rerun()
+
+    # ── 价格提醒（本地最新收盘越线触发，非盘中实时）────────────
+    with st.expander("🔔 价格提醒"):
+        alerts = dm.storage.get_price_alerts(active_only=True)
+        ac1, ac2, ac3, ac4 = st.columns([3, 2, 2, 1])
+        with ac1:
+            alert_code = st.selectbox(
+                "股票", list(name_map.keys()), key="alert_code",
+                format_func=lambda c: f"{name_map.get(c, '')}（{c}）")
+        with ac2:
+            alert_dir = st.radio("方向", ["above", "below"], horizontal=True,
+                                 format_func=lambda d: "≥ 目标价" if d == "above" else "≤ 目标价")
+        with ac3:
+            _bars = dm.storage.get_daily_bars(alert_code)
+            _last = float(_bars.iloc[-1]["close"]) if not _bars.empty else 10.0
+            alert_price = st.number_input("目标价", min_value=0.01,
+                                          value=round(_last, 2), step=0.01)
+        with ac4:
+            st.write("")
+            if st.button("添加", key="alert_add"):
+                dm.storage.add_price_alert(alert_code, name_map.get(alert_code, ""),
+                                           alert_dir, alert_price)
+                st.rerun()
+        if alerts:
+            for a in alerts:
+                row1, row2 = st.columns([6, 1])
+                sym = "≥" if a["direction"] == "above" else "≤"
+                row1.caption(f"{a['name']}（{a['code']}） {sym} {a['target_price']:.2f}"
+                             f" ｜ 创建于 {str(a['created_at'])[:16]}")
+                if row2.button("删除", key=f"alert_del_{a['id']}"):
+                    dm.storage.deactivate_price_alert(a["id"])
+                    st.rerun()
+        else:
+            st.caption("暂无生效中的提醒。触发基于本地最新收盘价（dashboard 打开时检查），非盘中实时。")
+        fired = [a for a in dm.storage.get_price_alerts(active_only=False)
+                 if a.get("triggered_at")][:5]
+        if fired:
+            st.caption("最近已触发：" + "；".join(
+                f"{a['name']} {str(a['triggered_at'])[:16]}" for a in fired))
 
     # 筛选
     if selected_tags:

@@ -32,6 +32,9 @@ class DataManager:
         self.storage = Storage(cfg["database"]["path"])
         self.cache_days = cfg["data"]["cache_days"]
         self.history_years = cfg["data"]["history_years"]
+        # 仅本地数据模式：True 时 get_* 只读库、不触发任何联网补拉。
+        # 用于网络降级/数据源限流时的筛选与回测（宁可跑陈旧数据，不可卡死）。
+        self.local_only = False
 
         # 初始化所有可用的 fetcher
         fetchers = {"akshare": AKShareFetcher()}
@@ -469,6 +472,9 @@ class DataManager:
         if start_date is None:
             start_date = (date.today() - timedelta(days=365 * self.history_years)).isoformat()
 
+        if self.local_only:
+            return self.storage.get_daily_bars(code, start_date, end_date)
+
         # 检查本地最新日期，决定是否需要增量拉取
         latest = self.storage.get_latest_bar_date(code)
         if latest is None or latest < end_date:
@@ -512,6 +518,9 @@ class DataManager:
         不支持指数；指数基准直接走 AKShareFetcher。失败时返回空 DataFrame，
         由 BacktestComparator 优雅降级（不阻断主回测）。
         """
+        if self.local_only:
+            # 本地不存指数K线，local_only 下直接降级为无基准（与取数失败同路径）
+            return pd.DataFrame()
         try:
             return self.fetcher.get_index_daily_bars(code, start_date, end_date)
         except Exception as e:
@@ -531,7 +540,7 @@ class DataManager:
     # ── 财务数据 ──────────────────────────────────────────────────
     def get_financial_data(self, code: str) -> pd.DataFrame:
         df = self.storage.get_financial_data(code)
-        if df.empty:
+        if df.empty and not self.local_only:
             logger.info(f"拉取 {code} 财务数据...")
             df_new = self.router.call("financial", code)
             if not df_new.empty:

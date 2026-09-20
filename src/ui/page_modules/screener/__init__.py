@@ -49,6 +49,12 @@ def render_sidebar():
         "行业/板块", industries,
         format_func=lambda x: label_map.get(x, x),
     )
+    dm.local_only = st.checkbox(
+        "仅使用本地数据（不联网补拉）",
+        value=getattr(dm, "local_only", False),
+        help="网络降级/数据源限流时开启：筛选只读本地库，宁可跑陈旧数据也不卡死")
+    if dm.local_only:
+        st.caption("⚠️ 本地模式：K线/财务不补拉，结果仅供快速验证")
     st.session_state["screener_strategies"] = st.multiselect(
         "选择策略（可多选）",
         list(STRATEGY_OPTIONS.keys()),

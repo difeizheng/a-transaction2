@@ -117,6 +117,18 @@ _MIGRATIONS = [
     (6, "backtest_results 逐笔交易(trades_detail)", "ALTER TABLE backtest_results ADD COLUMN trades_detail TEXT"),
     (7, "watchlist 标签(tags,分组)",            "ALTER TABLE watchlist ADD COLUMN tags TEXT DEFAULT ''"),
     (8, "positions 主键重建(code PRIMARY KEY)", _rebuild_positions_with_pk),
+    (9, "价格提醒(price_alerts)", """
+        CREATE TABLE IF NOT EXISTS price_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            name TEXT,
+            direction TEXT NOT NULL,       -- above / below
+            target_price REAL NOT NULL,
+            note TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            triggered_at TEXT,             -- 触发时刻（本地最新收盘越线）
+            created_at TEXT
+        )"""),
 ]
 
 
@@ -436,6 +448,13 @@ class Storage:
                 {"code": code}
             ).fetchone()
         return row[0] if row else None
+
+    def get_global_latest_bar_date(self) -> Optional[str]:
+        """全库最新K线日期（新鲜度徽标用，比 get_data_overview 轻量）。"""
+        with self.engine.connect() as conn:
+            return conn.execute(
+                text("SELECT MAX(trade_date) FROM daily_bars")
+            ).scalar()
 
     # ── financial_data ───────────────────────────────────────────
     def upsert_financial_data(self, df: pd.DataFrame):
@@ -1322,6 +1341,59 @@ class Storage:
                 "UPDATE watchlist SET tags = :tags WHERE code = :code"
             ), {"tags": tags, "code": code})
             conn.commit()
+
+    # ── price_alerts（价格提醒，本地最新收盘越线即触发）─────────────
+    def add_price_alert(self, code: str, name: str, direction: str,
+                        target_price: float, note: str = "") -> int:
+        assert direction in ("above", "below")
+        with self.engine.connect() as conn:
+            res = conn.execute(text("""
+                INSERT INTO price_alerts (code, name, direction, target_price, note, active, created_at)
+                VALUES (:code, :name, :direction, :target, :note, 1, :created)
+            """), {"code": code, "name": name, "direction": direction,
+                    "target": target_price, "note": note,
+                    "created": datetime.now().isoformat(timespec="seconds")})
+            conn.commit()
+            return res.lastrowid
+
+    def get_price_alerts(self, active_only: bool = True) -> list:
+        sql = "SELECT * FROM price_alerts"
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY id DESC"
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+    def deactivate_price_alert(self, alert_id: int):
+        with self.engine.connect() as conn:
+            conn.execute(text("UPDATE price_alerts SET active = 0 WHERE id = :id"),
+                         {"id": alert_id})
+            conn.commit()
+
+    def check_price_alerts(self) -> list:
+        """用本地最新收盘价检查生效中的提醒，越线的标记触发并返回列表。
+
+        刻意用本地K线而非实时行情：提醒是「粗粒度哨兵」，不追求盘中秒级；
+        无网络时也能工作。返回 [{alert..., last_close}]。
+        """
+        fired = []
+        for a in self.get_price_alerts(active_only=True):
+            bars = self.get_daily_bars(a["code"])
+            if bars.empty:
+                continue
+            last_close = float(bars.iloc[-1]["close"])
+            last_date = str(bars.iloc[-1]["trade_date"])[:10]
+            hit = ((a["direction"] == "above" and last_close >= a["target_price"]) or
+                   (a["direction"] == "below" and last_close <= a["target_price"]))
+            if hit:
+                with self.engine.connect() as conn:
+                    conn.execute(text(
+                        "UPDATE price_alerts SET active = 0, triggered_at = :t WHERE id = :id"
+                    ), {"t": datetime.now().isoformat(timespec="seconds"), "id": a["id"]})
+                    conn.commit()
+                fired.append({**a, "last_close": last_close, "last_date": last_date})
+        return fired
 
     def remove_from_watchlist(self, code: str):
         with self.engine.connect() as conn:

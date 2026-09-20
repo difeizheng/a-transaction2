@@ -63,6 +63,13 @@ def render_sidebar():
         index=0,
         format_func=lambda c: f"{BENCHMARK_NAMES.get(c, c)}（{c}）",
     )
+    dm = get_dm()
+    dm.local_only = st.checkbox(
+        "仅使用本地数据（不联网补拉）",
+        value=getattr(dm, "local_only", False),
+        help="网络降级/数据源限流时开启：回测只读本地库，宁可跑陈旧数据也不卡死；本地无指数K线，基准自动跳过")
+    if dm.local_only:
+        st.caption("⚠️ 本地模式：基准对比自动跳过")
     st.session_state["backtest_run"] = st.button("运行回测", type="primary", use_container_width=True)
 
     st.divider()
@@ -185,7 +192,7 @@ def _render_history(dm) -> None:
     st.subheader("历史回测记录")
     history = dm.storage.get_backtest_results()
     if history.empty:
-        st.caption("暂无历史记录")
+        st.caption("暂无历史记录——在左侧选择策略与区间后点击「运行回测」，结果会自动落库并在此展示。")
         return
     display_cols = [c for c in ["strategy_name", "start_date", "end_date", "total_return",
                                 "annual_return", "sharpe", "max_drawdown", "win_rate", "trades"]

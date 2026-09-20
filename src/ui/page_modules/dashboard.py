@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from src.ui.components.equity import render_equity_curve
+from src.ui.components.freshness import freshness_badge
 from src.ui.components.service_info import get_akshare_info, get_llm_info, render_service_info
 from src.ui.core import enrich_profit, get_config, get_dm, get_services, money_span, pct_span
 
@@ -67,7 +68,18 @@ def render():
     storage = dm.storage
 
     st.header("📊 总览仪表盘")
-    st.caption(f"数据截至 {date.today().isoformat()}")
+    # 真实数据新鲜度（旧版写的是「今天」，并不反映数据实际新旧）
+    st.caption(freshness_badge(storage.get_global_latest_bar_date(), "K线数据截至"))
+
+    # 价格提醒触发检查（基于本地最新收盘价；越线即置为已触发并在此横幅提醒）
+    try:
+        fired = storage.check_price_alerts()
+        for f in fired:
+            sym = "≥" if f["direction"] == "above" else "≤"
+            st.warning(f"🔔 价格提醒触发：{f['name']}（{f['code']}）最新收盘 "
+                       f"{f['last_close']:.2f}（{f['last_date']}）已越过 {sym} {f['target_price']:.2f}")
+    except Exception:
+        pass  # 提醒失败不影响主面板
 
     # ── 账户概览 + 市场情绪 ─────────────────────────────────────
     try:

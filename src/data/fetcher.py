@@ -231,10 +231,23 @@ class AKShareFetcher(BaseFetcher):
         return df[["code", "name"]]
 
     def get_industry_list(self, retries: int = 3) -> pd.DataFrame:
-        """获取东方财富行业板块列表（retries 可调；市场快照传 1 快速失败降级）。"""
+        """获取行业板块列表（含涨跌幅/上涨/下跌家数）。
+
+        主源东财 push2（易被限流）→ 备用同花顺 industry_summary（不同域名，
+        实测可抗东财限流）。THS 返回列归一化为东财口径（板块名称/涨跌幅/上涨家数/下跌家数）。
+        注意 THS 板块名与东财命名不同，该结果用于展示/广度统计，不可再拿去查成分股。
+        """
         import akshare as ak
-        df = _retry(lambda: ak.stock_board_industry_name_em(), retries=retries)
-        return df
+        try:
+            df = _retry(lambda: ak.stock_board_industry_name_em(), retries=retries)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            logger.warning(f"东财行业板块列表失败，切同花顺备源: {e}")
+        df_ths = _retry(lambda: ak.stock_board_industry_summary_ths(), retries=2)
+        if df_ths is None or df_ths.empty:
+            raise RuntimeError("行业板块列表主备源均失败")
+        return df_ths.rename(columns={"板块": "板块名称"})
 
     def get_realtime_quotes(self, codes: list) -> pd.DataFrame:
         """获取实时行情（批量）"""
