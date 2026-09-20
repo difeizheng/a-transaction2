@@ -80,6 +80,23 @@ def render():
             if not over_sl.empty:
                 names = "、".join(f"{r['name']}({r['profit_pct']:+.1f}%)" for _, r in over_sl.iterrows())
                 st.warning(f"⚠️ {len(over_sl)} 只持仓浮亏超止损线（-{rp.stop_loss_pct:.0f}%）：{names}")
+                # 从“只亮牌”到“能闭环”：两步确认后可按市价一键卖出超线持仓（模拟盘）
+                confirm = st.checkbox(
+                    f"确认按市价卖出以上 {len(over_sl)} 只超止损线持仓（全部数量，模拟盘）",
+                    key="risk_sell_confirm")
+                if st.button("🛑 执行风控建议卖出", disabled=not confirm,
+                             key="risk_sell_exec"):
+                    results = []
+                    for _, r in over_sl.iterrows():
+                        try:
+                            res = simulator.place_sell(str(r["code"]), int(r["quantity"]), None)
+                            results.append(f"{r['name']}：{res.get('msg', '成交') if res.get('success') else '失败——' + res.get('msg', '')}")
+                        except Exception as e:
+                            results.append(f"{r['name']}：下单异常 {e}")
+                    for line in results:
+                        st.caption(line)
+                    st.session_state["risk_sell_confirm"] = False
+                    st.rerun()
 
         st.subheader("当前持仓")
         try:

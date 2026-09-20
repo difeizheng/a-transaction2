@@ -184,11 +184,15 @@ def render():
 
     # ── 批量维护标签 ──────────────────────────────────────────
     with st.expander("🏷️ 批量维护标签"):
+        # 应用成功后下一轮 rerun 在控件创建前清空选择，避免残留旧选择/旧警告
+        if st.session_state.pop("_batch_clear_pending", False):
+            st.session_state["batch_codes_input"] = []
+            st.session_state["batch_tags_input"] = ""
         name_map = {it["code"]: it.get("name", "") for it in items}
         bc1, bc2, bc3 = st.columns([3, 2, 2])
         with bc1:
             batch_codes = st.multiselect(
-                "选择股票", list(name_map.keys()),
+                "选择股票", list(name_map.keys()), key="batch_codes_input",
                 format_func=lambda c: f"{name_map.get(c, '')}（{c}）")
         with bc2:
             batch_tags = st.text_input("标签（逗号分隔）", key="batch_tags_input",
@@ -207,7 +211,8 @@ def render():
                     else:
                         merged = ",".join(new_tags)
                     dm.storage.update_watchlist_tags(c, merged)
-                st.success(f"已{batch_mode}标签到 {len(batch_codes)} 只股票")
+                st.session_state["_batch_clear_pending"] = True
+                st.session_state["watchlist_nav_msg"] = f"已{batch_mode}标签到 {len(batch_codes)} 只股票"
                 st.rerun()
 
     # ── 价格提醒（本地最新收盘越线触发，非盘中实时）────────────

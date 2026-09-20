@@ -109,6 +109,10 @@ def _render_progress(task: dict):
         st.rerun()
 
     elif status in ("completed", "cancelled"):
+        # 更新会改变覆盖率/过期名单，清掉概览缓存让新数据立刻可见
+        _cached_overview.clear()
+        _cached_stale.clear()
+        _load_coverage.clear()
         elapsed = time.time() - task.get("start_time", time.time())
         label = "更新完成" if status == "completed" else "已停止"
         st.success(f"{label}，耗时 {elapsed:.0f}s")
@@ -125,8 +129,20 @@ def _render_progress(task: dict):
         st.error(f"更新失败：{task.get('error', '未知错误')}")
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_overview():
+    """概览 COUNT 查询结果缓存 120s——更新进度轮询每秒 rerun 一次，
+    不缓存等于每秒对 561MB 库做一遍多表 COUNT，是 websocket 假死的诱因。"""
+    return get_dm().storage.get_data_overview()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_stale(threshold: str):
+    return get_dm().storage.get_stale_stocks(threshold)
+
+
 def _render_overview(dm):
-    ov = dm.storage.get_data_overview()
+    ov = _cached_overview()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("总股票数", f"{ov['total_stocks']:,}")
     c2.metric("K线覆盖率", f"{ov['bars_coverage_pct']}%",
@@ -161,7 +177,7 @@ def _render_overview(dm):
 
     # 过期数据提示
     threshold = (date.today() - timedelta(days=5)).isoformat()
-    stale = dm.storage.get_stale_stocks(threshold)
+    stale = _cached_stale(threshold)
     if not stale.empty:
         col_warn, col_btn = st.columns([3, 1])
         col_warn.warning(f"⚠️ {len(stale)} 只股票的K线数据超过5个交易日未更新（或无数据）")
