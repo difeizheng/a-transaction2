@@ -228,6 +228,15 @@ def _render_sentiment_summary(dm, display: dict, result: dict | None):
         )
         summary = ""
         key_events = []
+        # 无会话内分析结果时，回退展示最近一次落库快照的 AI 总结与关键事件
+        # （与 dashboard 情绪卡同一份数据，避免刷新页面后总结“消失”）
+        try:
+            latest = dm.storage.get_market_sentiment_history(limit=1)
+            if latest:
+                summary = latest[0].get("summary") or ""
+                key_events = latest[0].get("key_events_json") or []
+        except Exception:
+            pass  # 读库失败不阻塞页面，按无总结渲染
 
     col_metric, col_trend = st.columns([1, 2])
     with col_metric:
@@ -258,6 +267,8 @@ def _render_sentiment_summary(dm, display: dict, result: dict | None):
     # LLM 定性总结
     if summary:
         st.info(summary)
+        if result is None:
+            st.caption("以上为最近一次已保存的 AI 分析；点击「刷新新闻并分析」可生成最新总结。")
     elif result is None:
         st.caption("💡 温度已由行情数据算出。点击「刷新新闻并分析」可获取 AI 定性总结与关键事件（仅 1 次调用）。")
     if key_events:

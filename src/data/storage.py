@@ -71,7 +71,43 @@ def _engine(db_path: str):
 
 # 历史迁移：每条对应一次 schema 演进。新库 CREATE TABLE 已含这些列（迁移对新库
 # 是 no-op，靠 _column_exists 幂等预检跳过）；旧库靠迁移补列。追加新列只需在
-# 列表末尾加一条 (version, 描述, ALTER SQL)，_run_migrations 会自动按序应用。
+def _rebuild_positions_with_pk(conn) -> None:
+    """v8 专用迁移：旧库 positions 表无 PRIMARY KEY（历史遗留建表），导致
+    upsert_position 的 ON CONFLICT(code) 每次抛 OperationalError，持仓现价/
+    T+1 解锁静默不落库。SQLite 不支持补加约束，只能建新表拷数据换名。
+    幂等：已有 PK 直接返回。
+    """
+    cols = conn.execute(text("PRAGMA table_info(positions)")).fetchall()
+    if not cols or any(c[5] for c in cols):  # c[5] 是 pk 序号
+        return
+    conn.execute(text("""
+        CREATE TABLE positions_new (
+            code TEXT PRIMARY KEY,
+            name TEXT,
+            quantity INTEGER,
+            available INTEGER,
+            cost_price REAL,
+            current_price REAL,
+            market_value REAL,
+            profit_loss REAL,
+            buy_date TEXT,
+            updated_at TEXT
+        )
+    """))
+    # 无约束旧表可能有重复 code：按 updated_at 升序写入，INSERT OR REPLACE 让最新行胜出
+    conn.execute(text("""
+        INSERT OR REPLACE INTO positions_new
+        SELECT code, name, quantity, available, cost_price, current_price,
+               market_value, profit_loss, buy_date, updated_at
+        FROM positions ORDER BY updated_at
+    """))
+    conn.execute(text("DROP TABLE positions"))
+    conn.execute(text("ALTER TABLE positions_new RENAME TO positions"))
+
+
+# 列表末尾加一条 (version, 描述, ALTER SQL 或可调用迁移)，_run_migrations 会自动按序应用。
+# 字符串 SQL 走「列存在预检 + ALTER」路径（幂等）；可调用对象用于 ALTER 表达不了的
+# 结构性迁移（如 v8 表重建），需自行保证幂等。
 _MIGRATIONS = [
     (1, "daily_bars 复权因子(adj_factor)",     "ALTER TABLE daily_bars ADD COLUMN adj_factor REAL"),
     (2, "financial_data 披露日(ann_date,PIT)", "ALTER TABLE financial_data ADD COLUMN ann_date TEXT"),
@@ -80,6 +116,7 @@ _MIGRATIONS = [
     (5, "account 峰值(peak_value,回撤)",        "ALTER TABLE account ADD COLUMN peak_value REAL"),
     (6, "backtest_results 逐笔交易(trades_detail)", "ALTER TABLE backtest_results ADD COLUMN trades_detail TEXT"),
     (7, "watchlist 标签(tags,分组)",            "ALTER TABLE watchlist ADD COLUMN tags TEXT DEFAULT ''"),
+    (8, "positions 主键重建(code PRIMARY KEY)", _rebuild_positions_with_pk),
 ]
 
 
@@ -935,6 +972,17 @@ class Storage:
         now = datetime.now().isoformat()
         for version, desc, sql in _MIGRATIONS:
             if version in applied:
+                continue
+            if callable(sql):
+                # 结构性迁移（表重建等），函数自行幂等
+                try:
+                    sql(conn)
+                except Exception as e:
+                    raise RuntimeError(f"schema 迁移 v{version}（{desc}）失败: {e}") from e
+                conn.execute(text(
+                    "INSERT OR IGNORE INTO schema_version (version, description, applied_at) "
+                    "VALUES (:v, :d, :t)"
+                ), {"v": version, "d": desc, "t": now})
                 continue
             if self._column_exists(conn, sql):
                 # 旧库已通过历史 try/except 加过列，登记后跳过（幂等）

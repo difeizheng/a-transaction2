@@ -222,3 +222,77 @@ class TestSaveBacktestResultFiltering:
         assert len(df) == 1
         assert df.iloc[0]["strategy_name"] == "ma_cross"
         assert "000001" in df.iloc[0]["trades_detail"]
+
+
+# ── positions 主键重建迁移（v8）──────────────────────────────────
+class TestPositionsPkMigration:
+    """v8：旧库 positions 无 PRIMARY KEY → upsert_position 的 ON CONFLICT(code)
+    每次抛 OperationalError，持仓现价/T+1 解锁静默不落库（2026-09 实测发现，
+    真实库持仓 updated_at 停在 2026-06-15）。迁移建新表拷数据换名补 PK。"""
+
+    def _make_legacy_db(self, db_path):
+        """手工造一个 v8 之前的坏库：positions 无 PK、含重复 code。"""
+        from sqlalchemy import create_engine, text
+        eng = create_engine(f"sqlite:///{db_path}")
+        with eng.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE positions (
+                    code TEXT, name TEXT, quantity BIGINT, available BIGINT,
+                    cost_price FLOAT, current_price FLOAT, market_value FLOAT,
+                    profit_loss FLOAT, buy_date TEXT, updated_at TEXT
+                )
+            """))
+            conn.execute(text(
+                "INSERT INTO positions VALUES "
+                "('000001','平安银行',1000,1000,10.0,9.5,9500,-500,'2026-01-01','2026-06-01T00:00:00'),"
+                "('000001','平安银行',1000,0,10.0,9.8,9800,-200,'2026-01-01','2026-06-15T00:00:00')"
+            ))
+            conn.commit()
+        eng.dispose()
+        return db_path
+
+    @pytest.mark.integration
+    def test_v8_rebuilds_legacy_table_and_dedupes(self, tmp_path):
+        from sqlalchemy import text
+        from src.data.storage import Storage
+
+        db = self._make_legacy_db(str(tmp_path / "legacy.db"))
+        s = Storage(db)
+
+        # 1) PK 已补上
+        cols = s.engine.connect().execute(text("PRAGMA table_info(positions)")).fetchall()
+        assert any(c[5] for c in cols), "positions 应有 PRIMARY KEY"
+
+        # 2) 重复 code 去重，updated_at 最新行胜出
+        rows = s.engine.connect().execute(
+            text("SELECT code, current_price FROM positions")).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == 9.8
+
+        # 3) v8 已登记
+        v = s.engine.connect().execute(
+            text("SELECT version FROM schema_version WHERE version=8")).fetchall()
+        assert len(v) == 1
+
+        # 4) upsert 不再抛错且能更新
+        s.upsert_position({"code": "000001", "name": "平安银行", "quantity": 1000,
+                           "available": 1000, "cost_price": 10.0, "current_price": 10.5,
+                           "market_value": 10500.0, "profit_loss": 500.0})
+        row = s.engine.connect().execute(
+            text("SELECT current_price FROM positions WHERE code='000001'")).fetchone()
+        assert row[0] == 10.5
+
+    @pytest.mark.integration
+    def test_v8_idempotent_on_fresh_db(self, storage):
+        """新库 CREATE 已含 PK：v8 应登记但不动表；重复构造 Storage 不炸。"""
+        from sqlalchemy import text
+        storage.upsert_position({"code": "000002", "name": "万科A", "quantity": 100,
+                                 "available": 100, "cost_price": 8.0, "current_price": 8.5,
+                                 "market_value": 850.0, "profit_loss": 50.0})
+        # 二次打开同一库：v8 已在 schema_version，直接跳过
+        from src.data.storage import Storage
+        db_path = storage.engine.url.database
+        Storage(db_path)
+        rows = storage.engine.connect().execute(
+            text("SELECT COUNT(*) FROM positions")).fetchone()
+        assert rows[0] == 1
