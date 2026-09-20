@@ -997,6 +997,17 @@ class Storage:
             """), {"since": since}).fetchone()
         return {"calls": row[0], "input_tokens": int(row[1]), "output_tokens": int(row[2])}
 
+    def get_llm_call_health(self, limit: int = 5) -> list:
+        """最近 ``limit`` 次 LLM 调用的健康状态（created_at/success/error），
+        供 UI 连续失败横幅判定。"""
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT created_at, provider, model, endpoint, success,
+                       substr(COALESCE(error, ''), 1, 160) AS error
+                FROM llm_call_log ORDER BY created_at DESC, id DESC LIMIT :limit
+            """), {"limit": limit}).fetchall()
+        return [dict(r._mapping) for r in rows]
+
     def get_source_routes(self) -> list:
         with self.engine.connect() as conn:
             rows = conn.execute(text("SELECT * FROM data_source_routes ORDER BY data_type")).fetchall()

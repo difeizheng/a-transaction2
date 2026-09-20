@@ -5,7 +5,7 @@
   token/延迟/成功与否），供审计回放、成本核算与幻觉追溯（``storage`` 可选注入）。
 - 成本：摘要/定性类调用用 light 模型（Haiku，约主模型 1/10 成本），深度推理用主模型；
   Claude 路径对 system 指令启用 prompt caching（读 cache 成本 1/10）。
-- 健壮性：所有 SDK 调用受 ``request_timeout`` 约束（默认 30s，防挂起卡死交易循环）；
+- 健壮性：所有 SDK 调用受 ``request_timeout`` 约束（默认 60s，防挂起卡死交易循环）；
   JSON 解析容错（strip / 去 markdown 包裹 / 失败记 raw 日志而非静默丢弃）。
 
 公开方法签名向后兼容：``call(prompt)`` / ``chat(messages, system)`` 旧调用不受影响，
@@ -45,15 +45,21 @@ class LLMAnalyzer:
         self.storage = storage  # 可选：传入则每次调用落 llm_call_log
         self.provider = self.cfg.get("provider", "claude")
         # SDK 默认 timeout 600s：网络挂起时 AutoTrader 串行调 top5，任一挂起→run()
-        # 卡 10 分钟。默认 30s，可由 config ``request_timeout`` 覆盖。
-        self._timeout = float(self.cfg.get("request_timeout", 30.0))
+        # 卡 10 分钟。默认 60s（兼容端点长 prompt 首调可超 30s），可由 config ``request_timeout`` 覆盖。
+        self._timeout = float(self.cfg.get("request_timeout", 60.0))
         self._claude_client = None
         self._openai_client = None
         # 模型分级：摘要/定性用 light（约 1/10 成本），深度推理用 main。
         # light 未配置时退化为 main（不破坏仅配了单一模型的旧 config）。
-        self._model_main = self.cfg.get("model_claude", "claude-sonnet-4-6")
-        self._model_light = self.cfg.get("model_claude_light", self._model_main)
+        # 主模型必须跟 provider 走：openai 兼容端点不认识 claude 模型名，
+        # 混用会 404（2026-09 真实故障：provider=openai 却发 claude-sonnet-4-6）。
         self._model_openai = self.cfg.get("model_openai", "gpt-4o")
+        if self.provider == "openai":
+            self._model_main = self._model_openai
+            self._model_light = self.cfg.get("model_openai_light", self._model_main)
+        else:
+            self._model_main = self.cfg.get("model_claude", "claude-sonnet-4-6")
+            self._model_light = self.cfg.get("model_claude_light", self._model_main)
 
     # ── client 缓存（含 timeout）─────────────────────────────────
     def _get_claude_client(self):
@@ -156,6 +162,14 @@ class LLMAnalyzer:
             logger.error(f"LLM对话失败: {e}")
             return f"对话失败: {e}"
 
+    # 失败响应哨兵：call/chat 失败时把错误当文本返回（保持字符串契约），
+    # 上层落库/展示前必须用 is_failure 拦截，否则错误文本会污染快照表。
+    FAIL_PREFIXES = ("分析失败:", "对话失败:")
+
+    @classmethod
+    def is_failure(cls, text) -> bool:
+        return isinstance(text, str) and text.startswith(cls.FAIL_PREFIXES)
+
     def _log(self, endpoint, model, prompt, response, usage,
              success: bool, error, t0: float) -> None:
         """落库 + 结构化日志。落库失败只 warning，不阻断主流程。"""
@@ -232,6 +246,8 @@ class LLMAnalyzer:
         data = self._parse_json_lenient(raw, "news_sentiment")
         if data:
             return data
+        if self.is_failure(raw):
+            return {"sentiment": "neutral", "summary": "", "key_events": [], "llm_ok": False}
         return {"sentiment": "neutral", "summary": raw[:200], "key_events": []}
 
     def summarize_market(
@@ -282,6 +298,8 @@ class LLMAnalyzer:
         data = self._parse_json_lenient(raw, "summarize_market")
         if data:
             return {"summary": data.get("summary", ""), "key_events": data.get("key_events", [])}
+        if self.is_failure(raw):
+            return {"summary": "", "key_events": [], "llm_ok": False}
         return {"summary": raw[:200], "key_events": []}
 
     def summarize_macro(
@@ -333,6 +351,8 @@ class LLMAnalyzer:
                 "policy_read": data.get("policy_read", ""),
                 "key_risks": data.get("key_risks", []),
             }
+        if self.is_failure(raw):
+            return {"summary": "", "policy_read": "", "key_risks": [], "llm_ok": False}
         return {"summary": raw[:200], "policy_read": "", "key_risks": []}
 
     def analyze_stock_trend(
@@ -382,6 +402,13 @@ class LLMAnalyzer:
         data = self._parse_json_lenient(raw, "stock_trend")
         if data:
             return data
+        if self.is_failure(raw):
+            return {
+                "trend": "未知", "confidence": 0,
+                "buy_suggestion": "观望", "analysis": "",
+                "stop_loss_pct": 5, "take_profit_pct": 15,
+                "llm_ok": False,
+            }
         return {
             "trend": "未知", "confidence": 0,
             "buy_suggestion": "观望", "analysis": raw[:300],

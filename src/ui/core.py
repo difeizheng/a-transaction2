@@ -7,7 +7,7 @@
    装饰器统一兜底：记日志 + st.error，应用其余部分不受影响。
 """
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 
@@ -88,6 +88,32 @@ def money_span(value: float) -> str:
 
 def today_str() -> str:
     return date.today().isoformat()
+
+
+def render_llm_health_banner(storage) -> None:
+    """LLM 连续失败全局横幅：最近 ≥3 次调用全失败且最近一次在 24h 内 → 告警。
+
+    静默失败是本系统最贵的坑（2026-09：provider=openai 发 claude 模型名 404，
+    AI 功能全挂无人知）。任何页面渲染前调用，异常静默（banner 绝不能拖垮页面）。
+    """
+    try:
+        calls = storage.get_llm_call_health(limit=5)
+        if len(calls) < 3:
+            return
+        recent = calls[:3]
+        if not all(c["success"] == 0 for c in recent):
+            return
+        latest = datetime.fromisoformat(calls[0]["created_at"])
+        if datetime.now() - latest > timedelta(hours=24):
+            return
+        err = (calls[0].get("error") or "未知错误").split("\n")[0][:120]
+        st.warning(
+            f"🤖 **LLM 调用连续失败**（{len(recent)} 次，最近 {latest:%m-%d %H:%M}）：{err}。"
+            "AI 分析/问答功能暂不可用，请检查 config/config.yaml 的 llm 配置与 API Key。",
+            icon="⚠️",
+        )
+    except Exception:
+        pass
 
 
 def enrich_profit(storage, summary: dict) -> dict:

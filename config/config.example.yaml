@@ -13,7 +13,8 @@ llm:
   model_claude: claude-sonnet-4-6
   model_claude_light: claude-haiku-4-5  # 摘要/定性类调用用（约主模型 1/10 成本）；未配置则退化为 model_claude
   model_openai: Pro/MiniMaxAI/MiniMax-M2.5
-  request_timeout: 30  # LLM 调用超时（秒），防挂起卡死交易循环（SDK 默认 600s）
+  # model_openai_light: 摘要/定性用轻量模型（不配则同主模型；主模型响应慢时建议配，如 qwen-turbo）
+  request_timeout: 60  # LLM 调用超时（秒），防挂起卡死交易循环（SDK 默认 600s）
 
 data:
   cache_days: 1  # 行情数据缓存天数，避免重复拉取

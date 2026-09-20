@@ -49,6 +49,13 @@ with st.sidebar:
     if hasattr(mod, "render_sidebar"):
         page_guard(mod.render_sidebar)()
 
+# LLM 连续失败全局横幅（静默失败最贵——2026-09 教训）
+from src.ui.core import get_dm, render_llm_health_banner
+try:
+    render_llm_health_banner(get_dm().storage)
+except Exception:
+    pass
+
 # ── 主内容区 ──────────────────────────────────────────────────────────────
 # 页面级错误边界：单页渲染异常不再拖垮整个 app（traceback 收进日志）
 page_guard(mod.render)()
