@@ -47,7 +47,8 @@ def _render_score_card(ev: dict, expanded: bool):
     score = ev.get("score", 0) or 0
     icon = "✅" if selected else "❌"
     reason = ev.get("reason", "")
-    title = f"{icon} **{ev['code']}** {ev.get('name', '')}  |  评分: {score:.2f}  |  {reason}"
+    st_mark = "  |  ⚠️ ST股" if "ST" in str(ev.get("name", "")).upper() else ""
+    title = f"{icon} **{ev['code']}** {ev.get('name', '')}  |  评分: {score:.2f}  |  {reason}{st_mark}"
 
     with st.expander(title, expanded=expanded):
         _render_strategy_detail(ev)
@@ -85,9 +86,10 @@ def _render_multi_strategy_card(code_data: dict, expanded: bool,
     passed_count = sum(1 for e in all_evals if e.get("selected"))
 
     icon = "✅" if is_selected else "❌"
+    st_mark = "  |  ⚠️ ST股" if "ST" in str(name).upper() else ""
     title = (
         f"{icon} **{code}** {name}  |  均分: {avg_score:.2f}  |  "
-        f"{passed_count}/{num_total} 策略通过"
+        f"{passed_count}/{num_total} 策略通过{st_mark}"
     )
 
     with st.expander(title, expanded=expanded):

@@ -139,7 +139,25 @@ def _render_overview(dm):
     c5.metric("K线总条数", f"{ov['total_bars']:,}")
     c6.metric("最新K线日期", ov["latest_bar_date"] or "无")
     c7.metric("财务总条数", f"{ov['total_financial']:,}")
-    c8.metric("最新财务日期", ov["latest_financial_date"] or "无")
+    fin_latest = (ov["latest_financial_date"] or "")[:10]
+    c8.metric("最新财务报告期", fin_latest or "无")
+
+    # 财务新鲜度按季报口径判断：最新报告期应 ≥ 上一个已结束季度的季末，
+    # 否则才是真正陈旧（K 线按日、财务按季，不能用同一把尺子）
+    if fin_latest:
+        today = date.today()
+        prev_q_end_month = (today.month - 1) // 3 * 3
+        if prev_q_end_month == 0:
+            expected = date(today.year - 1, 12, 31).isoformat()
+        else:
+            _q_end_day = {3: 31, 6: 30, 9: 30, 12: 31}[prev_q_end_month]
+            expected = date(today.year, prev_q_end_month, _q_end_day).isoformat()
+        if fin_latest < expected:
+            st.warning(
+                f"⚠️ 财务数据最新报告期 {fin_latest}，落后于上季末 {expected}，"
+                "建议运行财务数据更新")
+        else:
+            st.caption(f"财务报告期 {fin_latest} 为当前最新（季报口径，披露有滞后属正常）")
 
     # 过期数据提示
     threshold = (date.today() - timedelta(days=5)).isoformat()

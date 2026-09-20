@@ -10,7 +10,7 @@ import streamlit as st
 
 from src.ui.components.equity import render_equity_curve
 from src.ui.components.service_info import get_akshare_info, get_llm_info, render_service_info
-from src.ui.core import enrich_profit, get_config, get_simulator
+from src.ui.core import enrich_profit, get_config, get_dm, get_simulator
 
 
 def render():
@@ -54,9 +54,37 @@ def render():
 
         # 手动下单（人工断点：自动交易由 AutoTrader 调度执行，UI 只做手动单）
         with st.expander("📝 手动下单"):
+            # 联动入口：自选股页「去交易」按钮会预填 buy_code；此处消费
+            if "buy_code" in st.session_state:
+                st.session_state["manual_code"] = st.session_state.pop("buy_code")
+                st.session_state.pop("buy_name", None)
+
+            # 快速选择：自选股 + 当前持仓，选中即填入代码
+            quick: dict = {}
+            try:
+                for it in get_dm().storage.get_watchlist():
+                    quick[it["code"]] = (it.get("name", "") or it["code"], "⭐")
+            except Exception:
+                pass
+            if positions_df is not None and not positions_df.empty:
+                for _, row in positions_df.iterrows():
+                    quick.setdefault(str(row["code"]),
+                                     (row.get("name", "") or str(row["code"]), "💼"))
+
+            def _on_quick_pick():
+                picked = st.session_state.get("quick_pick")
+                if picked:
+                    st.session_state["manual_code"] = picked
+
+            if quick:
+                st.selectbox(
+                    "从自选股/持仓快速选择", [""] + list(quick.keys()),
+                    format_func=lambda x: f"{quick[x][1]} {quick[x][0]}（{x}）" if x else "—— 或手动输入 ——",
+                    key="quick_pick", on_change=_on_quick_pick)
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                code = st.text_input("股票代码", placeholder="600519")
+                code = st.text_input("股票代码", placeholder="600519", key="manual_code")
                 action = st.selectbox("方向", ["buy", "sell"])
             with col2:
                 quantity = st.number_input("数量（股）", min_value=100, step=100, value=100)
@@ -68,8 +96,9 @@ def render():
                     if code:
                         try:
                             p = price if price > 0 else None
+                            name = quick.get(code, (code, ""))[0]
                             if action == "buy":
-                                result = simulator.place_buy(code, code, int(quantity), p)
+                                result = simulator.place_buy(code, name, int(quantity), p)
                             else:
                                 result = simulator.place_sell(code, int(quantity), p)
                             if result.get("success"):

@@ -89,8 +89,9 @@ def _render_item(dm, item: dict) -> None:
     added_at = (item.get("added_at") or "")[:16]
     source = item.get("source", "")
     tag_str = f"  |  🏷️ {tags}" if tags else ""
+    st_mark = "  |  ⚠️ ST股" if "ST" in name.upper() else ""
 
-    with st.expander(f"**{code}** {name}  |  评分: {score:.2f}  |  {reason}{tag_str}",
+    with st.expander(f"**{code}** {name}  |  评分: {score:.2f}  |  {reason}{tag_str}{st_mark}",
                      expanded=False):
         col_info, col_actions = st.columns([3, 2])
 
@@ -104,7 +105,10 @@ def _render_item(dm, item: dict) -> None:
             if signals:
                 sig_cols = st.columns(min(len(signals), 4))
                 for i, (k, v) in enumerate(list(signals.items())[:4]):
-                    sig_cols[i].metric(k, v)
+                    sig_cols[i].metric(k, f"{v:.2f}" if isinstance(v, (int, float)) else v)
+                st.caption(
+                    f"信号为加入时快照（{added_at or '时间未知'}），非实时数据；"
+                    "最新信号请重新运行选股筛选")
 
             # 标签编辑
             new_tags = st.text_input("标签（逗号分隔）", value=tags, key=f"tags_{code}")

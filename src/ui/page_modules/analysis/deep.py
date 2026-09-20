@@ -16,12 +16,30 @@ def _render_stock_deep_analysis(dm, advisor):
         sr = next(s for s in screen_results if s.code == selected_code)
         target_code, target_name = sr.code, sr.name
     else:
-        st.info("请先在「选股筛选」页面运行策略，或直接输入股票代码")
-        col_c, col_n = st.columns(2)
-        target_code = col_c.text_input("股票代码（如 000001）", key="deep_code")
-        target_name = col_n.text_input("股票名称", key="deep_name")
-        if not target_name:
-            target_name = target_code
+        st.info("请先在「选股筛选」页面运行策略，或从自选股选择 / 直接输入股票代码")
+        target_code, target_name = "", ""
+        try:
+            watchlist = dm.storage.get_watchlist()
+        except Exception:
+            watchlist = []
+        if watchlist:
+            wl_opts = {it["code"]: f"⭐ {it.get('name', '')}（{it['code']}）"
+                       for it in watchlist}
+            pick = st.selectbox(
+                "从自选股选择", [""] + list(wl_opts.keys()),
+                format_func=lambda x: wl_opts.get(x, "—— 或手动输入 ——"),
+                key="deep_watch_pick")
+            if pick:
+                target_code = pick
+                target_name = next(
+                    (it.get("name", "") for it in watchlist if it["code"] == pick),
+                    "") or pick
+        if not target_code:
+            col_c, col_n = st.columns(2)
+            target_code = col_c.text_input("股票代码（如 000001）", key="deep_code")
+            target_name = col_n.text_input("股票名称", key="deep_name")
+            if not target_name:
+                target_name = target_code
 
     if target_code and st.button("🔍 开始深度分析", type="primary"):
         logger = StepLogger(f"深度分析 {target_name}（{target_code}）")

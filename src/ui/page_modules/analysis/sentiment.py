@@ -216,6 +216,7 @@ def _render_sentiment_summary(dm, display: dict, result: dict | None):
         sector_declines=display.get("sector_declines"),
     )
 
+    snap_date = ""
     if result:
         temperature = result.get("temperature", base["temperature"])
         label = result.get("label", base["label"])
@@ -228,15 +229,20 @@ def _render_sentiment_summary(dm, display: dict, result: dict | None):
         )
         summary = ""
         key_events = []
-        # 无会话内分析结果时，回退展示最近一次落库快照的 AI 总结与关键事件
-        # （与 dashboard 情绪卡同一份数据，避免刷新页面后总结“消失”）
+        # 无会话内分析结果时，回退展示最近一次落库快照（与 dashboard 情绪卡同一份
+        # 数据）：温度读数、AI 总结与关键事件，避免两处口径不一、刷新后总结“消失”
         try:
             latest = dm.storage.get_market_sentiment_history(limit=1)
             if latest:
-                summary = latest[0].get("summary") or ""
-                key_events = latest[0].get("key_events_json") or []
+                snap = latest[0]
+                summary = snap.get("summary") or ""
+                key_events = snap.get("key_events_json") or []
+                if snap.get("temperature") is not None:
+                    temperature = snap["temperature"]
+                    label = snap.get("label") or label
+                    snap_date = snap.get("snapshot_date") or ""
         except Exception:
-            pass  # 读库失败不阻塞页面，按无总结渲染
+            pass  # 读库失败不阻塞页面，按实时计算渲染
 
     col_metric, col_trend = st.columns([1, 2])
     with col_metric:
@@ -247,6 +253,8 @@ def _render_sentiment_summary(dm, display: dict, result: dict | None):
             f"板块中位 {comp.get('sector_median', 0):+.1f} ｜ "
             f"广度 {comp.get('sector_breadth', 0):+.1f}"
         )
+        if snap_date:
+            st.caption(f"读数来自 {snap_date} 已保存快照（与总览页口径一致）")
         if st.button("清除本次分析结果", key="clear_sentiment"):
             st.session_state.pop("market_sentiment", None)
             st.rerun()

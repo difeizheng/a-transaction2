@@ -107,8 +107,11 @@ def render():
             wdf = pd.DataFrame(watchlist)
             if "score" in wdf.columns:
                 wdf = wdf.sort_values("score", ascending=False)
+            top = wdf.head(5)[["code", "name", "score", "reason"]].copy()
+            top["score"] = pd.to_numeric(top["score"], errors="coerce").round(2)
             st.dataframe(
-                wdf.head(5)[["code", "name", "score", "reason"]],
+                top.rename(columns={"code": "代码", "name": "名称",
+                                    "score": "评分", "reason": "理由"}),
                 hide_index=True, use_container_width=True,
             )
             st.caption(f"共 {len(watchlist)} 只 · 完整管理见「⭐ 自选股」页")
