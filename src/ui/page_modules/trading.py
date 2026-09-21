@@ -198,6 +198,8 @@ def render():
                     f"卖建 {rec.get('n_sell_suggestions',0)} · 成交 {rec.get('n_executed',0)} · "
                     f"拦截 {rec.get('n_blocked',0)}")
             with st.expander(head):
+                st.caption("以下数值均为报告生成时点的快照（如卖出建议中的浮亏），"
+                           "与「账户与持仓」tab 的实时估值可能存在小差异。")
                 if rec.get("paused_reason"):
                     st.warning(f"⏸️ 暂停原因：{rec['paused_reason']}")
                 if rec.get("drawdown_pct") is not None:

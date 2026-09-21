@@ -75,10 +75,15 @@ def render_equity_curve(simulator=None, key_prefix: str = "eq") -> None:
                       showlegend=False, hovermode="x unified")
     fig.update_yaxes(tickprefix="¥", row=1, col=1)
     fig.update_yaxes(ticksuffix="%", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_equity_chart")
 
     last = df.iloc[-1]
     c1, c2, c3 = st.columns(3)
-    c1.metric("累计收益率", f"{last['return_pct']:+.2f}%")
+    # 标注口径与日期：与页面顶部「实时估值」收益区分开（第四轮巡检 P2）
+    c1.metric(f"累计收益率（{str(last['date'])[:10]} 快照）", f"{last['return_pct']:+.2f}%")
     c2.metric("当前回撤", f"{last['drawdown_pct']:.2f}%")
     c3.metric("最大回撤", f"{df['drawdown_pct'].min():.2f}%")
+    if len(df) < 10:
+        st.caption(
+            f"净值记录自 {str(df.iloc[0]['date'])[:10]} 开始（打开应用时每日自动补记），"
+            f"当前仅 {len(df)} 个快照点，曲线将随使用逐步丰富。")

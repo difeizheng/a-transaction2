@@ -93,7 +93,7 @@ def render():
         c1.metric("总资产", f"¥{summary['total_value']:,.0f}")
         c2.metric("现金", f"¥{summary['cash']:,.0f}")
         c3.metric("持仓市值", f"¥{summary['market_value']:,.0f}")
-        c4.metric("总盈亏", f"¥{summary['total_profit']:+,.0f}",
+        c4.metric("总盈亏（实时估值）", f"¥{summary['total_profit']:+,.0f}",
                   f"{summary['total_profit_pct']:+.2f}%")
         with c5:
             _render_sentiment_card(storage)

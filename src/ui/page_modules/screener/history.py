@@ -43,10 +43,21 @@ def _render_history_panel(dm):
         col_sel, col_act = st.columns([2, 3])
         with col_sel:
             session_ids = [s["id"] for s in sessions]
+            # 下拉直接带关键信息，不用先选中再看表格找（第四轮巡检 P2）
+            def _sess_label(sid):
+                if sid is None:
+                    return "选择记录…"
+                s = next((x for x in sessions if x["id"] == sid), None)
+                if not s:
+                    return f"#{sid}"
+                keys = json.loads(s.get("strategy_keys", "[]"))
+                sname = "、".join(STRATEGY_OPTIONS.get(k, k) for k in keys)
+                return (f"#{sid} | {sname} | {s.get('industry') or '全市场'} | "
+                        f"{(s.get('started_at') or '')[:16]} | 入选{s.get('selected_count') or 0}")
             selected_id = st.selectbox(
                 "选择记录操作",
                 [None] + session_ids,
-                format_func=lambda x: "选择记录…" if x is None else f"#{x}",
+                format_func=_sess_label,
                 key="hist_select_id",
             )
 

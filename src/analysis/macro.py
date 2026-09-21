@@ -65,7 +65,7 @@ INDICATOR_NAMES: dict[str, str] = {
     "pmi": "制造业 PMI",
     "ppi_cpi_gap": "PPI-CPI 剪刀差",
     "us_10y": "美10债收益率",
-    "usd_cny": "USD/CNY 中间价",
+    "usd_cny": "USD/CNY 中间价(20日变动)",  # 存的是 20 日变化量而非汇率水平
 }
 
 PILLAR_NAMES: dict[str, str] = {

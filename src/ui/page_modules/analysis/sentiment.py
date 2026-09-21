@@ -190,8 +190,10 @@ def _render_sector_rotation(snapshot: dict):
         return
 
     ordered = sorted(sectors, key=lambda x: x["pct_chg"], reverse=True)
-    gainers = ordered[:5]
-    losers = list(reversed(ordered[-5:]))
+    # 过滤符号：普涨日不把上涨板块列进「领跌」，普跌日同理（第四轮巡检实证：
+    # 黑色家电 +0.05% 曾出现在领跌榜）
+    gainers = [s for s in ordered if s["pct_chg"] > 0][:5]
+    losers = [s for s in reversed(ordered) if s["pct_chg"] < 0][:5]
 
     col_g, col_l = st.columns(2)
     with col_g:
@@ -203,6 +205,8 @@ def _render_sector_rotation(snapshot: dict):
         st.markdown(f"<table style='width:100%'>{rows}</table>", unsafe_allow_html=True)
     with col_l:
         st.caption("🔻 领跌板块")
+        if not losers:
+            st.caption("今日无下跌板块（普涨）")
         rows = "".join(
             f"<tr><td>{s['name']}</td><td style='text-align:right'>{_pct_span(s['pct_chg'])}</td></tr>"
             for s in losers

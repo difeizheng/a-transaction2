@@ -172,4 +172,4 @@ def render():
             if task.get("status") == "completed":
                 _render_qa_section(dm, session_id)
     else:
-        st.info("在左侧配置策略参数后点击「开始筛选」")
+        st.info("从上方「历史筛选记录」选择查看，或在左侧配置策略参数后点击「开始筛选」")

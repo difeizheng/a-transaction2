@@ -89,7 +89,8 @@ def _render_macro_pillars(components: dict, indicators_meta: dict):
             )
             tag = "bullish" if signal > 0.1 else ("bearish" if signal < -0.1 else "neutral")
             st.caption(_stance_label_cn(tag))
-            # 支柱下各指标（名 + latest + as_of）
+            # 支柱下各指标（名 + latest + as_of）；滞后超 90 天的显式标注
+            from datetime import date as _date
             for key, meta in (indicators_meta.get(pillar) or {}).items():
                 latest = meta.get("latest", 0)
                 ao = str(meta.get("as_of", ""))[:10]
@@ -97,7 +98,13 @@ def _render_macro_pillars(components: dict, indicators_meta: dict):
                     val_txt = f"{latest:.4g}"
                 except (TypeError, ValueError):
                     val_txt = str(latest)
-                st.caption(f"{INDICATOR_NAMES.get(key, key)}: {val_txt} · {ao}")
+                stale = ""
+                try:
+                    if (_date.today() - _date.fromisoformat(ao)).days > 90:
+                        stale = " ⚠️滞后"
+                except ValueError:
+                    pass
+                st.caption(f"{INDICATOR_NAMES.get(key, key)}: {val_txt} · {ao}{stale}")
 
 
 def _render_macro_stance(dm, score: float, label: str, components: dict,
