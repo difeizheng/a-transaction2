@@ -153,7 +153,13 @@ def _render_overview(dm):
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("K线总条数", f"{ov['total_bars']:,}")
-    c6.metric("最新K线日期", ov["latest_bar_date"] or "无")
+    # 覆盖率口径：避免单只股票刚补拉就把「最新日期」带偏（MAX 口径缺陷）
+    try:
+        cov_date, cov_pct = dm.storage.get_bars_coverage_date(0.8) or (None, 0)
+    except Exception:
+        cov_date, cov_pct = ov["latest_bar_date"], 0
+    c6.metric("K线数据截至（80% 覆盖口径）", cov_date or "无",
+              f"覆盖 {cov_pct * 100:.1f}%" if cov_pct else None)
     c7.metric("财务总条数", f"{ov['total_financial']:,}")
     fin_latest = (ov["latest_financial_date"] or "")[:10]
     c8.metric("最新财务报告期", fin_latest or "无")

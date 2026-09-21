@@ -5,7 +5,7 @@ import time
 
 import streamlit as st
 
-from src.ui.components.freshness import freshness_badge
+from src.ui.components.freshness import bars_freshness_badge
 from src.ui.components.screening_worker import screening_worker
 from src.ui.page_modules.screener.cards import _render_evaluations
 from src.ui.page_modules.screener.common import STRATEGY_OPTIONS
@@ -54,7 +54,7 @@ def _render_progress(task: dict, session_id: int, dm):
         elapsed = time.time() - task.get("start_time", time.time())
         final = task.get("final_results", [])
         st.success(f"筛选完成，{len(final)} 只入选（耗时 {elapsed:.0f}s）")
-        st.caption(freshness_badge(dm.storage.get_global_latest_bar_date(), "信号基于K线截至"))
+        st.caption(bars_freshness_badge(dm.storage, "信号基于K线截至"))
         if final:
             # 转为 ScreenResult 供 analysis 页面使用
             from src.strategy.base import ScreenResult

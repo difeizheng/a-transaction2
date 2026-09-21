@@ -6,7 +6,7 @@
 import json
 import streamlit as st
 
-from src.ui.components.freshness import freshness_badge
+from src.ui.components.freshness import bars_freshness_badge
 from src.ui.components.service_info import render_service_info, get_akshare_info
 from src.ui.core import get_dm
 
@@ -80,7 +80,7 @@ def render_sidebar():
     render_service_info([get_akshare_info()])
 
 
-def _render_item(dm, item: dict) -> None:
+def _render_item(dm, item: dict, latest=None) -> None:
     code = item["code"]
     name = item.get("name", code)
     score = item.get("score") or 0
@@ -98,6 +98,12 @@ def _render_item(dm, item: dict) -> None:
 
         with col_info:
             st.caption(f"来源: {source}  |  添加时间: {added_at}")
+            # 最新收盘价（本地K线）：放在快照信号上方，避免 5 个月前的快照 MA 被当成现价
+            if latest:
+                close, close_date = latest
+                lc1, lc2, _ = st.columns(3)
+                lc1.metric("最新收盘价", f"¥{close:.2f}")
+                lc2.caption(f"\n\n本地数据 {close_date}（非盘中实时）")
             signals = {}
             try:
                 signals = json.loads(item.get("signals") or "{}")
@@ -106,7 +112,7 @@ def _render_item(dm, item: dict) -> None:
             if signals:
                 sig_cols = st.columns(min(len(signals), 4))
                 for i, (k, v) in enumerate(list(signals.items())[:4]):
-                    sig_cols[i].metric(k, f"{v:.2f}" if isinstance(v, (int, float)) else v)
+                    sig_cols[i].metric(f"{k}（快照）", f"{v:.2f}" if isinstance(v, (int, float)) else v)
                 st.caption(
                     f"信号为加入时快照（{added_at or '时间未知'}），非实时数据；"
                     "最新信号请重新运行选股筛选")
@@ -154,7 +160,7 @@ def render():
     dm = get_dm()
 
     items = dm.storage.get_watchlist()
-    st.caption(freshness_badge(dm.storage.get_global_latest_bar_date(), "K线数据截至"))
+    st.caption(bars_freshness_badge(dm.storage, "K线数据截至"))
 
     if not items:
         st.info("自选股列表为空。在「选股筛选」页面完成筛选后，点击股票卡片上的「加入自选股」按钮，或在左侧手动添加。")
@@ -268,5 +274,10 @@ def render():
         items.sort(key=lambda x: x.get("code") or "")
 
     st.caption(f"显示 {len(items)} 只")
+    # 批量预取最新收盘价（一次连接循环主键查询，33 只约毫秒级）
+    try:
+        closes = dm.storage.get_latest_closes([it["code"] for it in items])
+    except Exception:
+        closes = {}
     for item in items:
-        _render_item(dm, item)
+        _render_item(dm, item, latest=closes.get(item["code"]))

@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from src.ui.components.equity import render_equity_curve
-from src.ui.components.freshness import freshness_badge
+from src.ui.components.freshness import bars_freshness_badge
 from src.ui.components.service_info import get_akshare_info, get_llm_info, render_service_info
 from src.ui.core import enrich_profit, get_config, get_dm, get_services, money_span, pct_span
 
@@ -69,7 +69,7 @@ def render():
 
     st.header("📊 总览仪表盘")
     # 真实数据新鲜度（旧版写的是「今天」，并不反映数据实际新旧）
-    st.caption(freshness_badge(storage.get_global_latest_bar_date(), "K线数据截至"))
+    st.caption(bars_freshness_badge(storage, "K线数据截至"))
 
     # 价格提醒触发检查（基于本地最新收盘价；越线即置为已触发并在此横幅提醒）
     try:

@@ -163,6 +163,48 @@ def _render_trade_drilldown(history: pd.DataFrame) -> None:
     win = (tdf["净利(含费用)"] > 0).sum()
     st.caption(f"共 {len(tdf)} 笔平仓：盈利 {win} 笔 / 亏损 {len(tdf) - win} 笔，"
                f"合计净利 ¥{total:,.0f}")
+    _render_entry_disclosure(tdf, row)
+    if len(tdf) >= 5 and win / len(tdf) < 0.3:
+        st.warning(
+            f"⚠️ 胜率 {win}/{len(tdf)}（{win / len(tdf) * 100:.0f}%）："
+            "该策略参数在此回测区间表现很差，其结果不建议作为选股依据；"
+            "可调整参数/区间后重新回测验证。")
+
+
+def _render_entry_disclosure(tdf: pd.DataFrame, row) -> None:
+    """建仓日分布 / 空仓时间披露：本回测是「一次性建仓+止损止盈退出」模型，
+    无再平衡/轮动——必须让用户看到仓位实际只覆盖了回测区间的一小段。"""
+    from datetime import date as _date
+
+    def _days(a: str, b: str):
+        try:
+            return (_date.fromisoformat(b) - _date.fromisoformat(a)).days
+        except Exception:
+            return None
+
+    buys = sorted({str(b)[:10] for b in tdf["买入日"] if str(b) != "None"})
+    if not buys:
+        return
+    start_d, end_d = str(row["start_date"])[:10], str(row["end_date"])[:10]
+    span = _days(start_d, end_d)
+    # 有持仓的自然日：合并各笔 [买入日, 卖出日] 区间
+    intervals = sorted(
+        (str(b)[:10], str(s)[:10]) for b, s in zip(tdf["买入日"], tdf["卖出日"])
+        if str(b) != "None" and str(s) != "None")
+    merged: list = []
+    for b, s in intervals:
+        if merged and b <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], s))
+        else:
+            merged.append((b, s))
+    held = sum(_days(b, s) or 0 for b, s in merged)
+    buy_desc = buys[0] if len(buys) == 1 else f"{buys[0]} 等 {len(buys)} 天"
+    msg = f"📌 建仓披露：全部买入集中在 {buy_desc}。"
+    if span and span > 0:
+        idle = max(0.0, (span - held) / span * 100)
+        msg += f"回测区间 {span} 个自然日中约 {idle:.0f}% 时间空仓。"
+    msg += "（一次性建仓模型，无再平衡/轮动——结果主要反映建仓初期表现）"
+    st.caption(msg)
 
 
 def _render_run_comparison(history: pd.DataFrame) -> None:
