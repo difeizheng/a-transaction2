@@ -90,7 +90,22 @@ def _render_stock_deep_analysis(dm, advisor):
         st.error(f"❌ 深度分析失败：{task.get('error')}")
         st.session_state["deep_task"] = None
 
+    # 历史回看：刷新后可直接载入上次分析（结果已落库 deep_analysis_reports）
     result = st.session_state.get("deep_analysis")
+    if not result and not task and target_code:
+        try:
+            prev = dm.storage.get_latest_deep_analysis(target_code)
+        except Exception:
+            prev = None
+        if prev:
+            with st.expander(
+                    f"📂 上次分析（{str(prev['created_at'])[:16]}，"
+                    f"{'AI 成功' if prev['llm_ok'] else 'AI 失败'}）"):
+                st.caption("结果已存档。点击载入查看，或点「开始深度分析」重新跑。")
+                if st.button("📂 载入上次分析", key="deep_load_prev"):
+                    st.session_state["deep_analysis"] = prev["result"]
+                    st.rerun()
+
     if result:
         _show_deep_analysis(result)
 
