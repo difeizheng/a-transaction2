@@ -129,6 +129,15 @@ _MIGRATIONS = [
             triggered_at TEXT,             -- 触发时刻（本地最新收盘越线）
             created_at TEXT
         )"""),
+    (10, "个股深度分析报告(deep_analysis_reports)", """
+        CREATE TABLE IF NOT EXISTS deep_analysis_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            name TEXT,
+            llm_ok INTEGER DEFAULT 1,   -- 0 = LLM 调用失败（数据面结果仍可用）
+            result_json TEXT NOT NULL,
+            created_at TEXT
+        )"""),
 ]
 
 
@@ -450,11 +459,57 @@ class Storage:
         return row[0] if row else None
 
     def get_global_latest_bar_date(self) -> Optional[str]:
-        """全库最新K线日期（新鲜度徽标用，比 get_data_overview 轻量）。"""
+        """全库最新K线日期（MAX 口径——注意：会被个别刚补拉的股票带偏，
+        展示「数据截至」请用 get_bars_coverage_date）。"""
         with self.engine.connect() as conn:
             return conn.execute(
                 text("SELECT MAX(trade_date) FROM daily_bars")
             ).scalar()
+
+    def get_bars_coverage_date(self, min_coverage: float = 0.8,
+                               lookback_days: int = 15) -> Optional[tuple]:
+        """覆盖率口径的「数据截至日期」：返回 (date, coverage)，
+        即最近 lookback_days 个有数据的交易日中，覆盖率达到 min_coverage 的最新日期。
+        避免单只股票刚补拉就把全局「最新日期」带偏（MAX 口径的缺陷）。
+        无达标日期时退化为覆盖率最高的日期。
+        性能：先走 idx_daily_bars_trade_date 取最近 N 个日期，再逐日期索引计数。"""
+        with self.engine.connect() as conn:
+            total = conn.execute(text("SELECT COUNT(*) FROM stock_list")).scalar() or 0
+            if total == 0:
+                return None
+            dates = [r[0] for r in conn.execute(text(
+                "SELECT DISTINCT trade_date FROM daily_bars "
+                "ORDER BY trade_date DESC LIMIT :n"
+            ), {"n": lookback_days}).fetchall()]
+            if not dates:
+                return None
+            best = None
+            for d in dates:
+                n = conn.execute(text(
+                    "SELECT COUNT(DISTINCT code) FROM daily_bars WHERE trade_date = :d"
+                ), {"d": d}).scalar() or 0
+                cov = n / total
+                if best is None or cov > best[1]:
+                    best = (d, cov)
+                if cov >= min_coverage:
+                    return (d, cov)
+        return best
+
+    def get_latest_closes(self, codes: list) -> dict:
+        """批量取最新收盘价：{code: (close, trade_date)}，走主键索引，33 只约毫秒级。"""
+        if not codes:
+            return {}
+        out = {}
+        sql = text("""
+            SELECT code, close, trade_date FROM daily_bars
+            WHERE code = :code ORDER BY trade_date DESC LIMIT 1
+        """)
+        with self.engine.connect() as conn:
+            for code in codes:
+                row = conn.execute(sql, {"code": code}).fetchone()
+                if row:
+                    out[row[0]] = (float(row[1]), row[2])
+        return out
 
     # ── financial_data ───────────────────────────────────────────
     def upsert_financial_data(self, df: pd.DataFrame):
@@ -906,12 +961,15 @@ class Storage:
         return pd.read_sql(sql, self.engine)
 
     def get_stale_stocks(self, threshold_date: str) -> pd.DataFrame:
+        # 相关子查询走 daily_bars 主键索引（code, trade_date），比
+        # LEFT JOIN + GROUP BY 全表分组快约 80 倍（实测 2.4s → 0.03s，5868 股 × 393 万行）。
         sql = """
-            SELECT s.code, s.name, MAX(d.trade_date) AS last_date
-            FROM stock_list s
-            LEFT JOIN daily_bars d ON s.code = d.code
-            GROUP BY s.code, s.name
-            HAVING last_date < :threshold OR last_date IS NULL
+            SELECT * FROM (
+                SELECT s.code, s.name,
+                       (SELECT MAX(d.trade_date) FROM daily_bars d WHERE d.code = s.code) AS last_date
+                FROM stock_list s
+            )
+            WHERE last_date < :threshold OR last_date IS NULL
         """
         return pd.read_sql(text(sql), self.engine, params={"threshold": threshold_date})
 
@@ -1394,6 +1452,39 @@ class Storage:
                     conn.commit()
                 fired.append({**a, "last_close": last_close, "last_date": last_date})
         return fired
+
+    # ── deep_analysis_reports（个股深度分析落库，防止长任务结果丢帧丢失）──
+    def save_deep_analysis(self, code: str, name: str, result: dict,
+                           llm_ok: bool = True) -> int:
+        """保存深度分析结果。result 需可 JSON 序列化。"""
+        import json as _json
+        payload = _json.dumps(result, ensure_ascii=False, default=str)
+        with self.engine.connect() as conn:
+            res = conn.execute(text("""
+                INSERT INTO deep_analysis_reports (code, name, llm_ok, result_json, created_at)
+                VALUES (:code, :name, :llm_ok, :result, :created)
+            """), {"code": code, "name": name, "llm_ok": 1 if llm_ok else 0,
+                    "result": payload,
+                    "created": datetime.now().isoformat(timespec="seconds")})
+            conn.commit()
+            return res.lastrowid
+
+    def get_latest_deep_analysis(self, code: str) -> Optional[dict]:
+        """取某股票最近一次深度分析报告（{id, code, name, llm_ok, result, created_at}）。"""
+        import json as _json
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT * FROM deep_analysis_reports WHERE code = :code
+                ORDER BY id DESC LIMIT 1
+            """), {"code": code}).fetchone()
+        if not row:
+            return None
+        d = dict(row._mapping)
+        try:
+            d["result"] = _json.loads(d.pop("result_json"))
+        except Exception:
+            d["result"] = None
+        return d
 
     def remove_from_watchlist(self, code: str):
         with self.engine.connect() as conn:

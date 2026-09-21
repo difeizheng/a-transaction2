@@ -1,7 +1,14 @@
-"""个股深度分析 tab：实时行情 + 技术面 + 相关新闻 + AI 综合分析。"""
+"""个股深度分析 tab：实时行情 + 技术面 + 相关新闻 + AI 综合分析。
+
+长任务后台化（第四轮巡检 P0 修复）：分析含 LLM 调用（30~90s），同步执行会让
+整个 rerun 期间无帧推送 → websocket 静默死亡、结果丢帧。改为后台线程 +
+前台短 rerun 轮询（与筛选页同模式），结果同时落库 deep_analysis_reports。
+"""
+import time
+
 import streamlit as st
 
-from src.ui.components.step_logger import StepLogger
+from src.ui.components.deep_worker import start_deep_analysis
 
 
 def _render_stock_deep_analysis(dm, advisor):
@@ -38,22 +45,50 @@ def _render_stock_deep_analysis(dm, advisor):
             col_c, col_n = st.columns(2)
             target_code = col_c.text_input("股票代码（如 000001）", key="deep_code")
             target_name = col_n.text_input("股票名称", key="deep_name")
-            if not target_name:
-                target_name = target_code
 
-    if target_code and st.button("🔍 开始深度分析", type="primary"):
-        logger = StepLogger(f"深度分析 {target_name}（{target_code}）")
+    # 名称回填：手动只输代码时从 stock_list 查名，避免标题显示「300936（300936）」
+    if target_code and (not target_name or target_name == target_code):
         try:
-            logger.step("拉取个股新闻")
-            dm.fetch_and_save_news(code=target_code)
-            logger.step("获取实时行情 + 技术指标")
-            logger.step("AI综合分析")
-            result = advisor.analyze_stock_deep(target_code, target_name)
-            st.session_state["deep_analysis"] = result
-            logger.complete("分析完成")
-        except Exception as e:
-            logger.fail(f"分析失败：{e}")
-            st.error(str(e))
+            info = dm.storage.get_stock_detail(target_code).get("info") or {}
+            if info.get("name"):
+                target_name = info["name"]
+        except Exception:
+            pass
+        if not target_name:
+            target_name = target_code
+
+    # ── 启动 / 轮询 / 收尾 ────────────────────────────────────────────
+    task = st.session_state.get("deep_task")
+    running = bool(task and task.get("status") == "running")
+
+    if target_code and st.button("🔍 开始深度分析", type="primary",
+                                 disabled=running):
+        st.session_state["deep_task"] = start_deep_analysis(
+            dm, advisor, target_code, target_name)
+        st.session_state.pop("deep_analysis", None)
+        st.rerun()
+
+    task = st.session_state.get("deep_task")
+    if task and task.get("status") == "running":
+        with st.status(f"深度分析 {task.get('name')}（{task.get('code')}）…",
+                       expanded=True) as status:
+            st.markdown(f"**当前步骤：{task.get('step', '…')}**")
+            for line in task.get("logs", []):
+                st.caption(line)
+        # 短 rerun 轮询：每 1.5s 一帧，websocket 保活（避免长 rerun 静默假死）
+        time.sleep(1.5)
+        st.rerun()
+    elif task and task.get("status") == "done":
+        st.session_state["deep_analysis"] = task["result"]
+        st.session_state["deep_task"] = None
+        if not task.get("llm_ok", True):
+            st.error("⚠️ AI 分析失败（LLM 超时或服务不可用）。"
+                     "下面展示的是行情 / 技术面 / 新闻等数据面结果，AI 结论不可用。")
+        else:
+            st.success("✅ 分析完成，结果已存档（刷新页面不丢失）")
+    elif task and task.get("status") == "error":
+        st.error(f"❌ 深度分析失败：{task.get('error')}")
+        st.session_state["deep_task"] = None
 
     result = st.session_state.get("deep_analysis")
     if result:
@@ -64,7 +99,11 @@ def _show_deep_analysis(result: dict):
     """展示个股深度分析结果（4个区块）。"""
     code = result.get("code", "")
     name = result.get("name", "")
-    st.markdown(f"### {name}（{code}）")
+    analyzed_at = result.get("analyzed_at", "")
+    title = f"### {name}（{code}）"
+    st.markdown(title)
+    if analyzed_at:
+        st.caption(f"分析时间：{analyzed_at}（结果已存档，刷新页面不丢失）")
 
     # 区块1：实时行情
     st.markdown("#### 📊 实时行情")
@@ -80,9 +119,10 @@ def _show_deep_analysis(result: dict):
     else:
         st.caption("暂无实时行情数据（非交易时段或数据源不可用）")
 
-    # 区块2：技术面分析
+    # 区块2：技术面分析（过滤已失效策略，避免占位噪音）
     st.markdown("#### 📈 技术面分析")
-    tech = result.get("technical", [])
+    tech = [t for t in result.get("technical", [])
+            if "已失效" not in (t.get("strategy_name") or "")]
     if tech:
         for t in tech:
             icon = "✅" if t["selected"] else "❌"
@@ -122,6 +162,12 @@ def _show_deep_analysis(result: dict):
     llm = result.get("llm_analysis", {})
     if not llm:
         st.caption("AI分析暂无结果")
+        return
+
+    if llm.get("llm_error"):
+        # LLM 失败：不渲染「未知/0%」这类误导性指标，只显式展示失败原因
+        st.error(f"AI 分析失败：{llm.get('analysis', '未知原因')[:200]}")
+        st.caption("以上为 LLM 返回的原始信息；行情 / 技术面 / 新闻数据不受影响，可稍后重试。")
         return
 
     c1, c2, c3 = st.columns(3)

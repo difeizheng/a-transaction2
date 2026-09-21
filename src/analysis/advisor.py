@@ -331,8 +331,10 @@ class Advisor:
         data = self.llm._parse_json_lenient(raw, "enhanced_stock")
         if data:
             return data
+        # LLM 调用失败/解析失败：显式打标，UI 据此给出醒目警示而非伪装成成功结果
         return {
             "trend": "未知", "confidence": 0,
             "buy_suggestion": "观望", "analysis": raw[:300],
             "stop_loss_pct": 8, "take_profit_pct": 20,
+            "llm_error": True,
         }
